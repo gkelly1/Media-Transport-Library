@@ -44,6 +44,46 @@
 
 ## Build DPDK
 
+### Native MSVC build (standalone script)
+
+Use the standalone script below from a native **Developer PowerShell** or
+**Developer Command Prompt** (MSVC `cl`, `link`, `lib` in `PATH`):
+
+```powershell
+.\script\build_dpdk_windows.ps1
+```
+
+Prerequisites:
+
+- Git for Windows (`git`)
+- Python + Meson (`meson`)
+- Ninja (`ninja`)
+- Visual Studio Build Tools / MSVC (Developer shell)
+
+Default output prefix:
+
+```text
+build\windows-dpdk\install
+```
+
+The script reads `DPDK_VER` and `DPDK_MTL_MINOR_VER` from `versions.env`,
+fetches a clean DPDK `v${DPDK_VER}` source tree, applies:
+
+1. `patches/dpdk/${DPDK_VER}/*.patch` (`git am`)
+2. `patches/dpdk/${DPDK_VER}/windows/*.patch` (`git apply`)
+
+Then it configures DPDK with Meson (`default_library=both`) and installs
+headers, generated `rte_config.h`, DPDK libraries/drivers, and
+`libdpdk.pc` for later native MTL Meson discovery (`dependency('libdpdk',
+required: true, static: true)`).
+
+Use `-Force` for a clean rerun of script-owned workspace directories.
+
+> **Note:** This script only builds DPDK. A native Windows MTL build script
+> is separate and not part of this step.
+
+### MSYS2/UCRT64 reference flow
+
 1. Clone the MTL repository
 
     ```bash

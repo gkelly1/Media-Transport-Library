@@ -16,6 +16,7 @@ Use this option only from a native **Developer PowerShell** or
 - Git for Windows (`git`)
 - Python + Meson (`meson`)
 - Ninja (`ninja`)
+- pkg-config compatible tool (`pkg-config` or `pkgconf`)
 - Visual Studio Build Tools / MSVC (Developer shell)
 
 ### Build DPDK (standalone script-managed workspace)
@@ -55,8 +56,62 @@ Use `-Force` for a clean rerun of script-owned workspace directories.
 Without `-Force`, the script keeps the cloned/patched DPDK source tree for
 subsequent native MTL builds.
 
-> **Note:** This script only builds DPDK. A native Windows MTL build script
-> is separate and not part of this step.
+### Build MTL (Native MSVC path)
+
+Run this from the same native Developer shell:
+
+```powershell
+.\script\build_mtl_windows.ps1
+```
+
+Default script-owned native MTL layout:
+
+```text
+build\windows-mtl\lib
+build\windows-mtl\app
+build\windows-mtl\tests
+build\windows-mtl\plugins
+build\windows-mtl\rxtxapp
+build\windows-mtl\install
+```
+
+The script consumes the native DPDK workspace from Option 1 using:
+
+- `build\windows-dpdk\install\lib\pkgconfig\libdpdk.pc` (for Meson dependency discovery)
+- `build\windows-dpdk\src\dpdk-${DPDK_VER}` (for `-Ddpdk_root_dir=...`)
+
+Supported script parameters:
+
+- `-WorkspaceRoot <path>` (default: `build\windows-mtl`)
+- `-DpdkInstallPrefix <path>` (default: `build\windows-dpdk\install`)
+- `-DpdkSourceDir <path>` (default: `build\windows-dpdk\src\dpdk-${DPDK_VER}`)
+- `-MtlInstallPrefix <path>` (default: `build\windows-mtl\install`)
+- `-BuildType release|debug|debugoptimized|plain` (default: `release`)
+- `-ValidateOnly` (prerequisite/layout checks only)
+- `-Force` (clean script-owned native MTL build/install directories before rebuild)
+
+Projects built in dependency order:
+
+1. top-level `mtl` library
+1. `app`
+1. `tests` (build only; this script does not run tests)
+1. `plugins`
+1. `tests/tools/RxTxApp`
+
+Intentionally skipped on Windows:
+
+- `ld_preload`
+- `manager`
+
+Examples:
+
+```powershell
+.\script\build_mtl_windows.ps1 -ValidateOnly
+```
+
+```powershell
+.\script\build_mtl_windows.ps1 -BuildType debug -Force
+```
 
 ## Option 2: MSYS2/UCRT64 build
 

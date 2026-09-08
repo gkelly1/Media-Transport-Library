@@ -185,7 +185,7 @@ $WorkspaceRoot = [System.IO.Path]::GetFullPath($WorkspaceRoot)
 $InstallPrefix = [System.IO.Path]::GetFullPath($InstallPrefix)
 $sourceRoot = Join-Path $WorkspaceRoot 'src'
 $sourceDir = Join-Path $sourceRoot "dpdk-$DpdkVersion"
-$buildDir = Join-Path $WorkspaceRoot 'build'
+$buildDir = Join-Path $sourceDir 'build'
 $patchStageDir = Join-Path $WorkspaceRoot 'patches-staged'
 $patchStamp = Join-Path $WorkspaceRoot ".patches_applied_${DpdkVersion}_${DpdkMtlMinorVersion}.stamp"
 
@@ -241,8 +241,8 @@ if (-not (Test-Path -LiteralPath $windowsPatchRoot)) {
   throw "Windows patch directory not found: $windowsPatchRoot"
 }
 
-$genericPatchFiles = Get-ChildItem -LiteralPath $genericPatchRoot -File -Filter '*.patch' | Sort-Object Name
-$windowsPatchFiles = Get-ChildItem -LiteralPath $windowsPatchRoot -File -Filter '*.patch' | Sort-Object Name
+$genericPatchFiles = @(Get-ChildItem -LiteralPath $genericPatchRoot -File -Filter '*.patch' | Sort-Object Name)
+$windowsPatchFiles = @(Get-ChildItem -LiteralPath $windowsPatchRoot -File -Filter '*.patch' | Sort-Object Name)
 if ($genericPatchFiles.Count -eq 0) {
   throw "No generic DPDK patches found in: $genericPatchRoot"
 }
@@ -296,7 +296,10 @@ $mesonArgs = @(
   $sourceDir
   "--prefix=$InstallPrefix"
   '-Dmax_lcores=256'
-  '-Ddefault_library=both'
+  '-Ddefault_library=shared'
+  '-Denable_stdatomic=true'
+  '-Dtests=false'
+  '-Ddisable_apps=test-bbdev,test-cmdline,test-fib,test-flow-perf,test-gpudev,test-pmd,test-regex'
 )
 if (Test-Path -LiteralPath $buildDir) {
   $mesonArgs += '--reconfigure'

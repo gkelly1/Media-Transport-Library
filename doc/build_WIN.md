@@ -72,12 +72,22 @@ fetches a clean DPDK `v${DPDK_VER}` source tree, applies:
 1. `patches/dpdk/${DPDK_VER}/*.patch` (`git am`)
 2. `patches/dpdk/${DPDK_VER}/windows/*.patch` (`git apply`)
 
-Then it configures DPDK with Meson (`default_library=both`) and installs
-headers, generated `rte_config.h`, DPDK libraries/drivers, and
-`libdpdk.pc` for later native MTL Meson discovery (`dependency('libdpdk',
-required: true, static: true)`).
+Then it configures DPDK from the source root with an in-tree build
+subdirectory (`build\windows-dpdk\src\dpdk-${DPDK_VER}\build`) using:
+
+- `-Dmax_lcores=256`
+- `-Ddefault_library=shared`
+- `-Denable_stdatomic=true`
+- `-Dtests=false`
+- `-Ddisable_apps=test-bbdev,test-cmdline,test-fib,test-flow-perf,test-gpudev,test-pmd,test-regex`
+
+This avoids MSVC link failures in unsupported DPDK test apps
+(`usual_getopt*`, `getline`) and installs headers, generated
+`rte_config.h`, DPDK libraries/drivers, and `libdpdk.pc`.
 
 Use `-Force` for a clean rerun of script-owned workspace directories.
+Without `-Force`, the script keeps the cloned/patched DPDK source tree for
+subsequent native MTL builds.
 
 > **Note:** This script only builds DPDK. A native Windows MTL build script
 > is separate and not part of this step.

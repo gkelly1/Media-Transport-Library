@@ -143,7 +143,14 @@
 1. Build DPDK
 
     ```bash
-    meson setup -Dmax_lcores=256 build
+    meson setup build . \
+      "--prefix=${MSYSTEM_PREFIX}" \
+      -Dplatform=generic \
+      -Dmax_lcores=256 \
+      -Ddefault_library=shared \
+      -Denable_stdatomic=true \
+      -Dtests=false \
+      -Ddisable_apps=test-bbdev,test-cmdline,test-fib,test-flow-perf,test-gpudev,test-pmd,test-regex
     ```
 
     ```bash

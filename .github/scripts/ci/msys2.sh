@@ -44,7 +44,14 @@ apply-patches)
 	;;
 build-dpdk)
 	cd "${root_dir}/dpdk"
-	meson setup build -Dplatform=generic
+	meson setup build . \
+		"--prefix=${MSYSTEM_PREFIX:?MSYSTEM_PREFIX is required}" \
+		-Dplatform=generic \
+		-Dmax_lcores=256 \
+		-Ddefault_library=shared \
+		-Denable_stdatomic=true \
+		-Dtests=false \
+		-Ddisable_apps=test-bbdev,test-cmdline,test-fib,test-flow-perf,test-gpudev,test-pmd,test-regex
 	meson install -C build
 	;;
 install-dpdk)

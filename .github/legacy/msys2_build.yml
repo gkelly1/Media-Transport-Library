@@ -134,7 +134,14 @@ jobs:
         if: ${{ steps.cache-dpdk.outputs.cache-hit != 'true' }}
         run: |
           cd dpdk
-          meson setup build -Dplatform=generic
+          meson setup build . \
+            --prefix="${MSYSTEM_PREFIX}" \
+            -Dplatform=generic \
+            -Dmax_lcores=256 \
+            -Ddefault_library=shared \
+            -Denable_stdatomic=true \
+            -Dtests=false \
+            -Ddisable_apps=test-bbdev,test-cmdline,test-fib,test-flow-perf,test-gpudev,test-pmd,test-regex
           meson install -C build
 
       - name: Install cached DPDK

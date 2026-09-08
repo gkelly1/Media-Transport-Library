@@ -1,22 +1,23 @@
-From bd34636ca6eb5d649ccc892c49fdf21eaadf0dd3 Mon Sep 17 00:00:00 2001
-From: "Kasiewicz, Marek" <marek.kasiewicz@intel.com>
-Date: Mon, 31 Mar 2025 12:48:41 +0000
-Subject: [PATCH 6/7] pcapng: add user timestamp support
+From e59dd33c031ac2c2cd5fdfb126bd3946d913c883 Mon Sep 17 00:00:00 2001
+From: Copilot <copilot@example.com>
+Date: Tue, 8 Sep 2026 10:35:21 +0000
+Subject: [PATCH] pcapng: add user timestamp support
 
-Signed-off-by: Kasiewicz, Marek <marek.kasiewicz@intel.com>
 ---
- lib/pcapng/rte_pcapng.c | 11 +++++++----
- lib/pcapng/rte_pcapng.h | 43 ++++++++++++++++++++++++++++++++++++++---
- 2 files changed, 47 insertions(+), 7 deletions(-)
+ lib/pcapng/rte_pcapng.c | 20 +++++--------------
+ lib/pcapng/rte_pcapng.h | 44 ++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 46 insertions(+), 18 deletions(-)
 
---- a/lib/pcapng/rte_pcapng.c	2026-04-23 05:28:47.894323050 -0400
-+++ b/lib/pcapng/rte_pcapng.c	2026-04-23 05:29:34.163321128 -0400
-@@ -546,14 +546,15 @@
+diff --git a/lib/pcapng/rte_pcapng.c b/lib/pcapng/rte_pcapng.c
+index b5d1026..6d7ba48 100644
+--- a/lib/pcapng/rte_pcapng.c
++++ b/lib/pcapng/rte_pcapng.c
+@@ -546,14 +546,14 @@ pcapng_vlan_insert(struct rte_mbuf *m, uint16_t ether_type, uint16_t tci)
   */
  
  /* Make a copy of original mbuf with pcapng header and options */
+-RTE_EXPORT_SYMBOL(rte_pcapng_copy)
 +RTE_EXPORT_SYMBOL(rte_pcapng_copy_ts)
- RTE_EXPORT_SYMBOL(rte_pcapng_copy)
  struct rte_mbuf *
 -rte_pcapng_copy(uint16_t port_id, uint32_t queue,
 +rte_pcapng_copy_ts(uint16_t port_id, uint32_t queue,
@@ -29,43 +30,46 @@ Signed-off-by: Kasiewicz, Marek <marek.kasiewicz@intel.com>
  {
  	struct pcapng_enhance_packet_block *epb;
  	uint32_t orig_len, pkt_len, padding, flags;
-@@ -691,7 +692,7 @@
+@@ -690,8 +690,8 @@ rte_pcapng_copy(uint16_t port_id, uint32_t queue,
+ 	/* Interface index is filled in later during write */
  	mc->port = port_id;
  
- 	/* Put timestamp in cycles here - adjust in packet write */
+-	/* Put timestamp in cycles here - adjust in packet write */
 -	timestamp = rte_get_tsc_cycles();
++	/* Use the caller timestamp when provided, otherwise capture the current TSC. */
 +	timestamp = ts ? ts : rte_get_tsc_cycles();
  	epb->timestamp_hi = timestamp >> 32;
  	epb->timestamp_lo = (uint32_t)timestamp;
  	epb->capture_length = pkt_len;
-@@ -720,7 +721,7 @@
+@@ -720,7 +720,6 @@ rte_pcapng_write_packets(rte_pcapng_t *self,
  	for (i = 0; i < nb_pkts; i++) {
  		struct rte_mbuf *m = pkts[i];
  		struct pcapng_enhance_packet_block *epb;
 -		uint64_t cycles, timestamp;
-+		//uint64_t cycles, timestamp;
  
  		/* sanity check that is really a pcapng mbuf */
  		epb = rte_pktmbuf_mtod(m, struct pcapng_enhance_packet_block *);
-@@ -737,6 +738,7 @@
+@@ -737,15 +736,6 @@ rte_pcapng_write_packets(rte_pcapng_t *self,
  			return -1;
  		}
  
-+#if 0
- 		/*
- 		 * When data is captured by pcapng_copy the current TSC is stored.
- 		 * Adjust the value recorded in file to PCAP epoch units.
-@@ -746,6 +748,7 @@
- 		timestamp = tsc_to_ns_epoch(&self->clock, cycles);
- 		epb->timestamp_hi = timestamp >> 32;
- 		epb->timestamp_lo = (uint32_t)timestamp;
-+#endif
+-		/*
+-		 * When data is captured by pcapng_copy the current TSC is stored.
+-		 * Adjust the value recorded in file to PCAP epoch units.
+-		 */
+-		cycles = (uint64_t)epb->timestamp_hi << 32;
+-		cycles += epb->timestamp_lo;
+-		timestamp = tsc_to_ns_epoch(&self->clock, cycles);
+-		epb->timestamp_hi = timestamp >> 32;
+-		epb->timestamp_lo = (uint32_t)timestamp;
  
  		/*
  		 * Handle case of highly fragmented and large burst size
---- a/lib/pcapng/rte_pcapng.h	2026-04-23 05:28:47.894323050 -0400
-+++ b/lib/pcapng/rte_pcapng.h	2026-04-23 05:29:18.146321793 -0400
-@@ -109,7 +109,7 @@
+diff --git a/lib/pcapng/rte_pcapng.h b/lib/pcapng/rte_pcapng.h
+index d8d328f..f5008e4 100644
+--- a/lib/pcapng/rte_pcapng.h
++++ b/lib/pcapng/rte_pcapng.h
+@@ -109,7 +109,7 @@ enum rte_pcapng_direction {
  };
  
  /**
@@ -74,7 +78,7 @@ Signed-off-by: Kasiewicz, Marek <marek.kasiewicz@intel.com>
   *
   * @param port_id
   *   The Ethernet port on which packet was received
-@@ -129,16 +129,54 @@
+@@ -129,17 +129,55 @@ enum rte_pcapng_direction {
   * @param comment
   *   Optional per packet comment.
   *   Truncated to UINT16_MAX characters.
@@ -86,11 +90,13 @@ Signed-off-by: Kasiewicz, Marek <marek.kasiewicz@intel.com>
   *   - NULL on error such as invalid port or out of memory.
   */
  struct rte_mbuf *
+-rte_pcapng_copy(uint16_t port_id, uint32_t queue,
 +rte_pcapng_copy_ts(uint16_t port_id, uint32_t queue,
-+		const struct rte_mbuf *m, struct rte_mempool *mp,
-+		uint32_t length,
+ 		const struct rte_mbuf *m, struct rte_mempool *mp,
+ 		uint32_t length,
+-		enum rte_pcapng_direction direction, const char *comment);
 +		enum rte_pcapng_direction direction, const char *comment, uint64_t ts);
-+
+ 
 +/* enable the define for MTL */
 +#define MTL_DPDK_HAS_PCAPNG_TS
 +
@@ -120,15 +126,16 @@ Signed-off-by: Kasiewicz, Marek <marek.kasiewicz@intel.com>
 + *   - NULL if allocation fails.
 + */
 +static inline struct rte_mbuf *
- rte_pcapng_copy(uint16_t port_id, uint32_t queue,
- 		const struct rte_mbuf *m, struct rte_mempool *mp,
- 		uint32_t length,
--		enum rte_pcapng_direction direction, const char *comment);
-+		enum rte_pcapng_direction direction, const char *comment) {
-+  return rte_pcapng_copy_ts(port_id, queue, m, mp, length, direction, comment, 0);
++rte_pcapng_copy(uint16_t port_id, uint32_t queue,
++		const struct rte_mbuf *m, struct rte_mempool *mp,
++		uint32_t length,
++		enum rte_pcapng_direction direction, const char *comment)
++{
++	return rte_pcapng_copy_ts(port_id, queue, m, mp, length, direction, comment, 0);
 +}
  
- 
  /**
+  * Determine optimum mbuf data size.
 -- 
-2.34.1
+2.55.0
+

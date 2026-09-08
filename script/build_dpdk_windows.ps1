@@ -275,12 +275,18 @@ if (-not (Test-Path -LiteralPath $patchStamp)) {
   foreach ($patchFile in (Get-ChildItem -LiteralPath $stagedGenericDir -File -Filter '*.patch' | Sort-Object Name)) {
     Write-Info "git am $($patchFile.Name)"
     & git -C $sourceDir am --keep-non-patch --whitespace=nowarn $patchFile.FullName
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to apply generic patch: $($patchFile.Name)"
+    }
   }
 
   Write-Step "Applying Windows MTL patches with git apply"
   foreach ($patchFile in (Get-ChildItem -LiteralPath $stagedWindowsDir -File -Filter '*.patch' | Sort-Object Name)) {
     Write-Info "git apply $($patchFile.Name)"
     & git -C $sourceDir apply --whitespace=nowarn $patchFile.FullName
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to apply Windows patch: $($patchFile.Name)"
+    }
   }
 
   Set-Content -LiteralPath $patchStamp -Value "dpdk=$DpdkVersion mtl_minor=$DpdkMtlMinorVersion"

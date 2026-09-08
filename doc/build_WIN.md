@@ -1,68 +1,34 @@
 # Build guide for Windows
 
-## Requirements
+## Choose one independent build option
+
+Choose exactly one option below. Do not mix commands, prerequisites, or paths
+between the two options.
+
+## Option 1: Native MSVC build
+
+Use this option only from a native **Developer PowerShell** or
+**Developer Command Prompt** (MSVC `cl`, `link`, `lib` in `PATH`).
+
+### Prerequisites
 
 - Windows Server 2025
-
-## Prepare build environment
-
-1. Install MSYS2
-
-    Download the latest installer from <https://www.msys2.org/>
-
-1. Install npcap
-
-    Download the latest installer from <https://npcap.com/#download>
-
-1. Run MSYS2 UCRT64
-
-    > **Note:** All the following commands should be executed in UCRT64 environment.
-
-1. Install tools
-
-    ```bash
-    pacman -S git pactoys unzip
-    ```
-
-    ```bash
-    pacboy -S dlfcn:p gcc:p gtest:p json-c:p libpcap:p meson:p mman-win32:p
-    ```
-
-1. Install npcap SDK
-
-    ```bash
-    wget https://npcap.com/dist/npcap-sdk-1.16.zip
-    ```
-
-    ```bash
-    unzip -d npcap-sdk-1.16 ./npcap-sdk-1.16.zip
-    ```
-
-    ```bash
-    cp -r ./npcap-sdk-1.16/lib/x64/. "${MSYSTEM_PREFIX}/lib"
-    ```
-
-## Build DPDK
-
-### Native MSVC build (standalone script)
-
-Use the standalone script below from a native **Developer PowerShell** or
-**Developer Command Prompt** (MSVC `cl`, `link`, `lib` in `PATH`):
-
-```powershell
-.\script\build_dpdk_windows.ps1
-```
-
-Prerequisites:
-
 - Git for Windows (`git`)
 - Python + Meson (`meson`)
 - Ninja (`ninja`)
 - Visual Studio Build Tools / MSVC (Developer shell)
 
-Default output prefix:
+### Build DPDK (standalone script-managed workspace)
+
+```powershell
+.\script\build_dpdk_windows.ps1
+```
+
+Script-owned workspace and output paths:
 
 ```text
+build\windows-dpdk\src
+build\windows-dpdk\src\dpdk-${DPDK_VER}\build
 build\windows-dpdk\install
 ```
 
@@ -92,7 +58,45 @@ subsequent native MTL builds.
 > **Note:** This script only builds DPDK. A native Windows MTL build script
 > is separate and not part of this step.
 
-### MSYS2/UCRT64 reference flow
+## Option 2: MSYS2/UCRT64 build
+
+Use this option only from the **MSYS2 UCRT64** shell.
+
+### Prerequisites
+
+- Windows Server 2025
+- MSYS2 (download from <https://www.msys2.org/>)
+- npcap (download from <https://npcap.com/#download>)
+
+### Prepare the MSYS2/UCRT64 environment
+
+1. Run MSYS2 UCRT64.
+
+1. Install tools.
+
+    ```bash
+    pacman -S git pactoys unzip
+    ```
+
+    ```bash
+    pacboy -S dlfcn:p gcc:p gtest:p json-c:p libpcap:p meson:p mman-win32:p
+    ```
+
+1. Install npcap SDK.
+
+    ```bash
+    wget https://npcap.com/dist/npcap-sdk-1.16.zip
+    ```
+
+    ```bash
+    unzip -d npcap-sdk-1.16 ./npcap-sdk-1.16.zip
+    ```
+
+    ```bash
+    cp -r ./npcap-sdk-1.16/lib/x64/. "${MSYSTEM_PREFIX}/lib"
+    ```
+
+### Build DPDK (MSYS2 path: `<repo>/dpdk`)
 
 1. Clone the MTL repository
 
@@ -110,7 +114,8 @@ subsequent native MTL builds.
 
 1. Clone the DPDK repository
 
-    > **Note:** The DPDK repository should be located directly in the MTL repository.
+    > **Note:** The DPDK repository should be located directly in the MTL repository root:
+    > `<repo>/dpdk`.
 
     `versions.env` in the MTL repository holds the DPDK version to use. Read the file to set `DPDK_VER`.
 
@@ -192,6 +197,8 @@ subsequent native MTL builds.
 
 1. Build DPDK
 
+    The DPDK build directory for this flow is `<repo>/dpdk/build`.
+
     ```bash
     meson setup -Dmax_lcores=256 build
     ```
@@ -218,9 +225,12 @@ subsequent native MTL builds.
     cp "${MTL_PATH}/sched.h.bak" "${MSYSTEM_PREFIX}/include/sched.h"
     ```
 
-## Build MTL
+### Build MTL (MSYS2/UCRT64)
 
 1. Run the build script
+
+    The MSYS2/UCRT64 flow installs DPDK into `${MSYSTEM_PREFIX}` and then builds
+    MTL from `<repo>`.
 
     ```bash
     cd "$MTL_PATH"

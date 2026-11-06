@@ -30,6 +30,7 @@ spec:
 ```text
 usage: create-dmf-manifest [-h] --perfspect DIR --profile DIR --service SERVICE
                            [--name NAME] [--output OUTPUT] [--namespace NAMESPACE]
+                           [--frame-rate RATE]
                            [--cpu-margin FACTOR] [--memory-margin FACTOR]
                            [--schema FILE] [--no-validate] [--dry-run]
 ```
@@ -42,10 +43,20 @@ usage: create-dmf-manifest [-h] --perfspect DIR --profile DIR --service SERVICE
 | `--name NAME` | Override `metadata.name` (default: `<service>-<scenario>-<resolution>`) |
 | `--output FILE` | Output path (default: `manifest/resource-manifest.yaml`) |
 | `--namespace NS` | Kubernetes namespace (default: `mxl`) |
+| `--frame-rate RATE` | Frame rate for the input and output formats, e.g. `60` or `60000/1001`. Default: the run's measured FPS (see below) |
 | `--cpu-margin FACTOR` | CPU safety multiplier (default: `1.20`) |
 | `--memory-margin FACTOR` | Memory safety multiplier (default: `1.25`) |
 | `--no-validate` | Skip schema validation |
 | `--dry-run` | Print manifest to stdout instead of writing a file |
+
+**Frame rate.** Like the resolution, the frame rate comes from the profiling run, not
+from a constant. The generator takes the `FFmpeg progress` FPS rows in `metrics.csv`
+(the median decoder session, since the decoder is the paced source; the service's own
+rows if there is no decoder) and snaps it to the nearest standard rate within 1 %:
+59.98 becomes `60`, 59.94 becomes `60000/1001`. The chosen value and its source are
+recorded in the manifest's header comment. If the run has no FPS rows, or its FPS is
+not within 1 % of a standard rate (the run was not delivering its nominal rate), the
+generator stops and asks for `--frame-rate` rather than guess.
 
 **Example:**
 

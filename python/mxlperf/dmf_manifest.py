@@ -45,6 +45,19 @@ _RESOLUTION_MAP = {
 # the caller; no generator-enforced allowlist is applied.  The original manifest
 # schema carries no resolution constraints.
 
+# Broadcast frame rates a measured FPS is snapped to, as the string the schema
+# expects.  NTSC rates are rationals: 59.94 is "60000/1001", not "59.94".
+_STANDARD_FRAME_RATES = (
+    (24000 / 1001, "24000/1001"), (24.0, "24"), (25.0, "25"),
+    (30000 / 1001, "30000/1001"), (30.0, "30"),
+    (50.0, "50"), (60000 / 1001, "60000/1001"), (60.0, "60"),
+    (120000 / 1001, "120000/1001"), (120.0, "120"),
+)
+# A measured rate must be within this fraction of a standard rate to snap to it.
+# Far outside it the run was not delivering its nominal rate, so guessing one
+# would put a wrong number in the manifest.
+_FRAME_RATE_TOLERANCE = 0.01
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PerfSpect JSON parsing
 # ──────────────────────────────────────────────────────────────────────────────
@@ -839,6 +852,36 @@ def parse_metrics_csv(
     }
 
 
+def measured_frame_rate(csv_path: Path, service: str) -> float | None:
+    """Return the stream's measured frame rate from the ``FFmpeg progress`` rows.
+
+    Those rows are the measurement-window frame delta per session.  The decoder
+    is the paced source (``-re``), so its rate is the stream's own rate and is
+    preferred; a run without decoder rows falls back to *service*'s rows.  The
+    median across sessions keeps one stalled stream from moving the answer.
+    """
+    by_role: dict[str, list[float]] = {}
+    with csv_path.open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            if row.get("category") != "FFmpeg progress" or row.get("metric") != "fps":
+                continue
+            value = _parse_avg(row.get("value", ""))
+            if value is not None and value > 0:
+                by_role.setdefault(_metric_row_service(row), []).append(value)
+    values = by_role.get("decoder") or by_role.get(service)
+    if not values:
+        return None
+    values.sort()
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+
+
+def snap_frame_rate(measured: float) -> str | None:
+    """Snap a measured rate to the nearest standard rate, or None if none is close."""
+    rate, text = min(_STANDARD_FRAME_RATES, key=lambda item: abs(item[0] - measured))
+    return text if abs(rate - measured) <= rate * _FRAME_RATE_TOLERANCE else None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Unit conversion helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -879,6 +922,7 @@ def build_manifest(
     role: str,
     scenario: str = "",
     resolution: str = "1080p",
+    frame_rate: str = "",
     host_caps: dict[str, Any] | None = None,
     cpu_cores: float | None = None,
     memory_mib: int | None = None,
@@ -915,6 +959,8 @@ def build_manifest(
         role:           ``spec.role`` — derived from ``--service``.
         scenario:       Scenario name from ``scenarios/*.env`` (informational).
         resolution:     e.g. ``"1080p"`` → sets frame dimensions.
+        frame_rate:     Frame rate string such as ``"60"`` or ``"60000/1001"``;
+                        omitted from the manifest when empty.
         host_caps:      Dict from ``parse_perfspect_json``; written to
                         ``spec.requirements.host_capabilities`` including any
                         ``cpu.features`` discovered by PerfSpect.
@@ -926,23 +972,16 @@ def build_manifest(
     """
     frame_dims = _RESOLUTION_MAP.get(resolution.lower())
 
+    video_input: dict[str, Any] = {"media_type": "video/v210"}
+    video_output: dict[str, Any] = {"media_type": "video/H264"}
     if frame_dims is not None:
         frame_w, frame_h = frame_dims
-        video_input: dict[str, Any] = {
-            "media_type": "video/v210",
-            "frame_width": frame_w,
-            "frame_height": frame_h,
-            "frame_rate": "25",
-        }
-        video_output: dict[str, Any] = {
-            "media_type": "video/H264",
-            "frame_width": frame_w,
-            "frame_height": frame_h,
-            "frame_rate": "25",
-        }
-    else:
-        video_input = {"media_type": "video/v210", "frame_rate": "25"}
-        video_output = {"media_type": "video/H264", "frame_rate": "25"}
+        for video in (video_input, video_output):
+            video["frame_width"] = frame_w
+            video["frame_height"] = frame_h
+    if frame_rate:
+        video_input["frame_rate"] = frame_rate
+        video_output["frame_rate"] = frame_rate
 
     manifest: dict[str, Any] = {
         "apiVersion": "mxl.media.fn/v1alpha1",
@@ -1206,6 +1245,16 @@ See docs/15-dmf-crm-manifest.md for full documentation.
         ),
     )
     parser.add_argument(
+        "--frame-rate",
+        default="",
+        metavar="RATE",
+        help=(
+            "Override the frame rate written to the manifest, e.g. 60 or 60000/1001.  "
+            "By default it is the measured FPS of the profiling run, snapped to the "
+            "nearest standard rate."
+        ),
+    )
+    parser.add_argument(
         "--output",
         default="manifest/resource-manifest.yaml",
         help="Output path for the generated manifest (default: manifest/resource-manifest.yaml).",
@@ -1319,12 +1368,35 @@ See docs/15-dmf-crm-manifest.md for full documentation.
             f"for service '{args.service}'.{available_hint}"
         )
 
+    # ── Frame rate ────────────────────────────────────────────────────────────
+    if args.frame_rate:
+        if not re.fullmatch(r"[1-9][0-9]*(/[1-9][0-9]*)?", args.frame_rate):
+            raise SystemExit(f"ERROR: --frame-rate must look like 60 or 60000/1001, got '{args.frame_rate}'")
+        frame_rate = args.frame_rate
+        frame_rate_source = "--frame-rate override"
+    else:
+        measured = measured_frame_rate(metrics_path, args.service)
+        if measured is None:
+            raise SystemExit(
+                f"ERROR: no 'FFmpeg progress' fps rows found in {metrics_path}, so the frame rate "
+                "cannot be taken from the profiling run.\n       Pass --frame-rate (for example 60)."
+            )
+        frame_rate = snap_frame_rate(measured) or ""
+        if not frame_rate:
+            raise SystemExit(
+                f"ERROR: measured {measured:.3f} FPS in {metrics_path} is not within "
+                f"{_FRAME_RATE_TOLERANCE:.0%} of a standard frame rate; the run was not delivering "
+                "its nominal rate.\n       Pass --frame-rate to state it explicitly."
+            )
+        frame_rate_source = f"measured {measured:.3f} FPS in metrics.csv"
+
     # ── Generate ──────────────────────────────────────────────────────────────
     manifest = build_manifest(
         name=manifest_name,
         role=args.service,
         scenario=scenario,
         resolution=resolution,
+        frame_rate=frame_rate,
         preset=preset,
         bitrate=bitrate,
         dec_threads=dec_threads,
@@ -1368,6 +1440,7 @@ See docs/15-dmf-crm-manifest.md for full documentation.
         f"# Profiling source : {profile_src}\n"
         f"# Profile config   : {config_path}\n"
         f"# Scenario         : {scenario}\n"
+        f"# Frame rate       : {frame_rate} ({frame_rate_source})\n"
         f"# Service / role   : {args.service}\n"
         f"# Schema           : {args.schema}\n"
         "#\n"

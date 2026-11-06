@@ -26,8 +26,10 @@ from mxlperf.dmf_manifest import (
     build_manifest,
     cores_to_millicore_str,
     mib_to_k8s_memory,
+    measured_frame_rate,
     parse_metrics_csv,
     parse_perfspect_json,
+    snap_frame_rate,
     validate_manifest,
     main,
 )
@@ -469,6 +471,147 @@ def test_build_manifest_resolution_2160p():
     assert video_in["frame_height"] == 2160
 
 
+def test_build_manifest_frame_rate_applies_to_input_and_output():
+    m = build_manifest(name="enc", role="encoder", resolution="1080p", frame_rate="60")
+    assert m["spec"]["inputs"][0]["format"]["video"]["frame_rate"] == "60"
+    assert m["spec"]["outputs"]["encoded-output"]["format"]["video"]["frame_rate"] == "60"
+
+
+def test_build_manifest_without_frame_rate_does_not_invent_one():
+    m = build_manifest(name="enc", role="encoder", resolution="1080p")
+    assert "frame_rate" not in m["spec"]["inputs"][0]["format"]["video"]
+    assert "frame_rate" not in m["spec"]["outputs"]["encoded-output"]["format"]["video"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Frame rate from the profiling run
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _fps_csv(tmp_path, *rows):
+    path = tmp_path / "metrics.csv"
+    lines = ["category,metric,unit,value,scope,session,role"]
+    lines += [
+        f"FFmpeg progress,fps,frames/s,avg={value:.6f};min={value:.6f};max={value:.6f},"
+        f"measurement-window frame delta,{session},{role}"
+        for role, session, value in rows
+    ]
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+@pytest.mark.parametrize("measured, expected", [
+    (59.976, "60"), (60.025, "60"), (59.94, "60000/1001"), (59.91, "60000/1001"),
+    (29.97, "30000/1001"), (25.002, "25"), (50.1, "50"), (23.976, "24000/1001"),
+])
+def test_snap_frame_rate_to_standard_rates(measured, expected):
+    assert snap_frame_rate(measured) == expected
+
+
+@pytest.mark.parametrize("measured", [40.0, 58.0, 12.0, 90.0])
+def test_snap_frame_rate_refuses_a_rate_that_is_not_close_to_a_standard(measured):
+    assert snap_frame_rate(measured) is None
+
+
+def test_measured_frame_rate_prefers_the_paced_decoder(tmp_path):
+    path = _fps_csv(tmp_path, ("decoder", "s01", 59.97), ("encoder", "s01", 41.0))
+    assert measured_frame_rate(path, "encoder") == pytest.approx(59.97)
+
+
+def test_measured_frame_rate_uses_the_median_across_sessions(tmp_path):
+    path = _fps_csv(
+        tmp_path, ("decoder", "s01", 59.97), ("decoder", "s02", 59.98), ("decoder", "s03", 12.0),
+    )
+    assert measured_frame_rate(path, "encoder") == pytest.approx(59.97)
+
+
+def test_measured_frame_rate_falls_back_to_the_service_rows(tmp_path):
+    path = _fps_csv(tmp_path, ("packager", "s01", 50.0))
+    assert measured_frame_rate(path, "packager") == pytest.approx(50.0)
+    assert measured_frame_rate(path, "encoder") is None
+
+
+def test_measured_frame_rate_none_without_fps_rows(tmp_path):
+    path = tmp_path / "metrics.csv"
+    path.write_text("category,metric,unit,value,scope,session,role\n")
+    assert measured_frame_rate(path, "encoder") is None
+
+
+def _profile_with_fps(tmp_path, *rows):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    base = (FIXTURES / "metrics-sample.csv").read_text().splitlines()
+    kept = [line for line in base if not line.startswith("FFmpeg progress,fps")]
+    fps_rows = _fps_csv(tmp_path, *rows).read_text().splitlines()[1:]
+    profile.joinpath("metrics.csv").write_text("\n".join(kept + fps_rows) + "\n")
+    profile.joinpath("config.json").write_text(json.dumps(_profile_config()))
+    return profile
+
+
+def test_cli_frame_rate_follows_the_run_not_a_constant(tmp_path, capsys):
+    profile = _profile_with_fps(tmp_path, ("decoder", "s01", 59.976), ("encoder", "s01", 60.006))
+    assert main([
+        "--perfspect", str(PERFSPECT_HIER), "--profile", str(profile),
+        "--service", "encoder", "--dry-run",
+    ]) == 0
+    out = capsys.readouterr().out
+    doc = yaml.safe_load(out)
+    assert doc["spec"]["inputs"][0]["format"]["video"]["frame_rate"] == "60"
+    assert "# Frame rate       : 60 (measured 59.976 FPS in metrics.csv)" in out
+
+
+def test_cli_frame_rate_ntsc_is_a_rational(tmp_path, capsys):
+    profile = _profile_with_fps(tmp_path, ("decoder", "s01", 59.93))
+    assert main([
+        "--perfspect", str(PERFSPECT_HIER), "--profile", str(profile),
+        "--service", "encoder", "--dry-run",
+    ]) == 0
+    doc = yaml.safe_load(capsys.readouterr().out)
+    assert doc["spec"]["inputs"][0]["format"]["video"]["frame_rate"] == "60000/1001"
+
+
+def test_cli_frame_rate_override_wins(tmp_path, capsys):
+    profile = _profile_with_fps(tmp_path, ("decoder", "s01", 59.976))
+    assert main([
+        "--perfspect", str(PERFSPECT_HIER), "--profile", str(profile),
+        "--service", "encoder", "--frame-rate", "50", "--dry-run",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert yaml.safe_load(out)["spec"]["inputs"][0]["format"]["video"]["frame_rate"] == "50"
+    assert "--frame-rate override" in out
+
+
+def test_cli_frame_rate_override_is_validated(tmp_path):
+    profile = _profile_with_fps(tmp_path, ("decoder", "s01", 59.976))
+    with pytest.raises(SystemExit, match="--frame-rate must look like"):
+        main([
+            "--perfspect", str(PERFSPECT_HIER), "--profile", str(profile),
+            "--service", "encoder", "--frame-rate", "sixty", "--dry-run",
+        ])
+
+
+def test_cli_refuses_a_run_that_missed_its_nominal_rate(tmp_path):
+    profile = _profile_with_fps(tmp_path, ("decoder", "s01", 41.0))
+    with pytest.raises(SystemExit, match="not within 1% of a standard frame rate"):
+        main([
+            "--perfspect", str(PERFSPECT_HIER), "--profile", str(profile),
+            "--service", "encoder", "--dry-run",
+        ])
+
+
+def test_cli_requires_fps_rows_or_an_override(tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    base = (FIXTURES / "metrics-sample.csv").read_text().splitlines()
+    profile.joinpath("metrics.csv").write_text(
+        "\n".join(line for line in base if not line.startswith("FFmpeg progress,fps")) + "\n")
+    profile.joinpath("config.json").write_text(json.dumps(_profile_config()))
+    args = ["--perfspect", str(PERFSPECT_HIER), "--profile", str(profile), "--service", "encoder", "--dry-run"]
+    with pytest.raises(SystemExit, match="Pass --frame-rate"):
+        main(args)
+    assert main([*args, "--frame-rate", "60"]) == 0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Validation
 # ──────────────────────────────────────────────────────────────────────────────
@@ -628,6 +771,8 @@ def test_cli_uses_profile_config_for_scenario_resolution(tmp_path, capsys):
         category,metric,unit,value,scope,session,role
         Prometheus,workload_cpu_cores,native,avg=6.250000;min=1;max=1,"{""pod"": ""mxl-encoder-s01""}",s01,encoder
         Prometheus,workload_memory_bytes,native,avg=805306368;min=1;max=1,"{""pod"": ""mxl-encoder-s01""}",s01,encoder
+        FFmpeg progress,fps,frames/s,avg=59.976518;min=59.976518;max=59.976518,measurement-window frame delta,s01,decoder
+        FFmpeg progress,fps,frames/s,avg=60.006283;min=60.006283;max=60.006283,measurement-window frame delta,s01,encoder
     """))
     profile.joinpath("config.json").write_text(json.dumps(_profile_config(
         RESOLUTION="4k",
@@ -653,6 +798,9 @@ def test_cli_uses_profile_config_for_scenario_resolution(tmp_path, capsys):
     video = doc["spec"]["inputs"][0]["format"]["video"]
     assert video["frame_width"] == 3840
     assert video["frame_height"] == 2160
+    # The rate comes from the measured FPS, not a constant
+    assert video["frame_rate"] == "60"
+    assert doc["spec"]["outputs"]["encoded-output"]["format"]["video"]["frame_rate"] == "60"
     # spec.args must not be emitted
     assert "args" not in doc["spec"]
 
@@ -679,6 +827,7 @@ def test_cli_arbitrary_service_selection(tmp_path):
         category,metric,unit,value,scope,session,role
         Prometheus,workload_cpu_cores,native,avg=2.500000;min=1;max=1,"{""pod"": ""mxl-packager-s01""}",s01,packager
         Prometheus,workload_memory_bytes,native,avg=268435456;min=1;max=1,"{""pod"": ""mxl-packager-s01""}",s01,packager
+        FFmpeg progress,fps,frames/s,avg=50.001000;min=50.001000;max=50.001000,measurement-window frame delta,s01,packager
     """))
     profile.joinpath("config.json").write_text(json.dumps(_profile_config(SCENARIO="custom-svc")))
 

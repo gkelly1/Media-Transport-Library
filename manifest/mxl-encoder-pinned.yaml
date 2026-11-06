@@ -25,7 +25,7 @@ spec:
         media_type: video/v210
         frame_width: 1920
         frame_height: 1080
-        frame_rate: '25'
+        frame_rate: '60'
   outputs:
     encoded-output:
       format:
@@ -33,7 +33,7 @@ spec:
           media_type: video/H264
           frame_width: 1920
           frame_height: 1080
-          frame_rate: '25'
+          frame_rate: '60'
   requirements:
     cpu:
       cpu: 4771m

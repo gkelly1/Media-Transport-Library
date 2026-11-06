@@ -8,15 +8,18 @@
  * encoder plugin are bypassed.
  */
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
+#define st22_tx_create ut22p_tx_capture_create
 #undef MTL_HAS_USDT
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #include "st2110/pipeline/st22_pipeline_tx.c"
 #pragma GCC diagnostic pop
+#undef st22_tx_create
 
 #include "common/ut_common.h"
 
@@ -26,6 +29,9 @@ struct ut22p_tx_ctx {
   struct st22p_tx_frame* framebuffs;
   int framebuff_cnt;
   uint64_t mock_ptp_ns;
+  bool encode_blocking;
+  bool blocking;
+  struct st22_encode_dev_impl encode_dev;
 };
 
 #include "pipeline/st22p_tx_harness.h"
@@ -75,6 +81,8 @@ ut22p_tx_ctx* ut22p_tx_ctx_create(int framebuff_cnt) {
   p->transport = (st22_tx_handle)(uintptr_t)0x1;
   p->block_get = false;
   p->encode_block_get = false;
+  /* ops.fps 0 is ST_FPS_P59_94, so cache the period create would cache for it */
+  ut22p_tx_set_fps(ctx, ST_FPS_P59_94);
   /* ops.flags left 0: no DROP_WHEN_LATE / USER_PACING, so tx_st22p_if_frame_late
    * returns immediately and next_frame never touches the (absent) transport. */
 
@@ -83,8 +91,65 @@ ut22p_tx_ctx* ut22p_tx_ctx_create(int framebuff_cnt) {
 
 void ut22p_tx_ctx_destroy(ut22p_tx_ctx* ctx) {
   if (!ctx) return;
+  if (ctx->blocking) {
+    mt_pthread_mutex_destroy(&ctx->pipeline.block_wake_mutex);
+    mt_pthread_cond_destroy(&ctx->pipeline.block_wake_cond);
+  }
+  if (ctx->encode_blocking) {
+    mt_pthread_mutex_destroy(&ctx->pipeline.encode_block_wake_mutex);
+    mt_pthread_cond_destroy(&ctx->pipeline.encode_block_wake_cond);
+  }
   free(ctx->framebuffs);
   free(ctx);
+}
+
+void ut22p_tx_ctx_enable_blocking(ut22p_tx_ctx* ctx, uint64_t timeout_ns) {
+  struct st22p_tx_ctx* p = &ctx->pipeline;
+  mt_pthread_mutex_init(&p->block_wake_mutex, NULL);
+  mt_pthread_cond_wait_init(&p->block_wake_cond);
+  p->block_timeout_ns = timeout_ns;
+  p->block_get = true;
+  ctx->blocking = true;
+}
+
+void ut22p_tx_ctx_enable_encode_blocking(ut22p_tx_ctx* ctx, uint64_t timeout_ns) {
+  struct st22p_tx_ctx* p = &ctx->pipeline;
+  mt_pthread_mutex_init(&p->encode_block_wake_mutex, NULL);
+  mt_pthread_cond_wait_init(&p->encode_block_wake_cond);
+  p->encode_block_timeout_ns = timeout_ns;
+  p->encode_block_get = true;
+  ctx->encode_blocking = true;
+}
+
+void ut22p_tx_ctx_set_encoder(ut22p_tx_ctx* ctx) {
+  struct st22_encode_session_impl* session = &ctx->encode_dev.sessions[0];
+  session->parent = &ctx->encode_dev;
+  ctx->pipeline.encode_impl = session;
+  ctx->pipeline.derive = false;
+  for (int i = 0; i < ctx->framebuff_cnt; i++)
+    ctx->framebuffs[i].src.priv = &ctx->framebuffs[i];
+}
+
+void ut22p_tx_set_ready(ut22p_tx_ctx* ctx, bool ready) {
+  ctx->pipeline.ready = ready;
+}
+
+void ut22p_tx_wake_block(ut22p_tx_ctx* ctx) {
+  st22p_tx_wake_block(&ctx->pipeline);
+}
+
+void ut22p_tx_encode_wake_block(ut22p_tx_ctx* ctx) {
+  tx_st22p_encode_wake_block(&ctx->pipeline);
+}
+
+void ut22p_tx_begin_destroy(ut22p_tx_ctx* ctx) {
+  struct st22p_tx_ctx* p = &ctx->pipeline;
+  mt_handle_begin_destroy(&p->lc_destroying, &p->type, MT_ST22_HANDLE_PIPELINE_TX);
+  tx_st22p_block_wake_all(p);
+}
+
+int ut22p_tx_encode_get_frame(ut22p_tx_ctx* ctx) {
+  return tx_st22p_encode_get_frame(&ctx->pipeline) ? 0 : -EBUSY;
 }
 
 int ut22p_tx_framebuff_cnt(const ut22p_tx_ctx* ctx) {
@@ -101,6 +166,18 @@ void ut22p_tx_set_flags(ut22p_tx_ctx* ctx, uint32_t flags) {
 
 void ut22p_tx_set_fps(ut22p_tx_ctx* ctx, enum st_fps fps) {
   ctx->pipeline.ops.fps = fps;
+  /* mirror the period st22p_tx_create() caches for ops.fps. Zero it on an
+   * out-of-table fps rather than leaving the previous value: a future caller
+   * that passes one then fails the window assertions instead of passing on a
+   * stale period. */
+  if (st_frame_period_ns(fps, &ctx->pipeline.frame_period_ns) < 0)
+    ctx->pipeline.frame_period_ns = 0;
+}
+
+void ut22p_tx_set_fps_mismatch(ut22p_tx_ctx* ctx, enum st_fps cached_fps,
+                               enum st_fps ops_fps) {
+  ut22p_tx_set_fps(ctx, cached_fps);
+  ctx->pipeline.ops.fps = ops_fps;
 }
 
 void ut22p_tx_set_notify_frame_done(ut22p_tx_ctx* ctx,
@@ -151,4 +228,32 @@ int ut22p_tx_all_free(const ut22p_tx_ctx* ctx) {
 
 int ut22p_tx_frame_stat(const ut22p_tx_ctx* ctx, int i) {
   return (int)ctx->framebuffs[i].stat;
+}
+
+static struct st22_tx_ops ut22p_tx_transport_ops;
+
+st22_tx_handle ut22p_tx_capture_create(mtl_handle mt, struct st22_tx_ops* ops) {
+  (void)mt;
+  ut22p_tx_transport_ops = *ops;
+  return NULL;
+}
+
+int ut22p_tx_transport_report_late(ut22p_tx_ctx* ctx, uint64_t epoch_skipped) {
+  memset(&ut22p_tx_transport_ops, 0, sizeof(ut22p_tx_transport_ops));
+  tx_st22p_create_transport(&ctx->impl, &ctx->pipeline, &ctx->pipeline.ops);
+  if (!ut22p_tx_transport_ops.notify_frame_late) return -ENOENT;
+  return ut22p_tx_transport_ops.notify_frame_late(ut22p_tx_transport_ops.priv,
+                                                  epoch_skipped);
+}
+
+static struct mtl_main_impl ut22p_tx_create_impl;
+
+st22p_tx_handle ut22p_tx_create(struct st22p_tx_ops* ops) {
+  struct mtl_main_impl* impl = &ut22p_tx_create_impl;
+  impl->type = MT_HANDLE_MAIN;
+  impl->user_para.num_ports = 1;
+  snprintf(impl->user_para.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "ut22p_port");
+  impl->inf[MTL_PORT_P].socket_id = rte_socket_id();
+  snprintf(ops->port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "ut22p_port");
+  return st22p_tx_create(impl, ops);
 }

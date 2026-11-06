@@ -4,6 +4,8 @@
 # Copyright 2025 Intel Corporation
 
 : "${EXIT_ON_FAILURE:=1}"
+# Comma-separated NoCtxTest cases to run under isolate.sh; the others run directly.
+: "${NOCTX_ISOLATE_CASES:=st20p_default_timestamps,st20p_default_timestamps_1080p59_94,st20p_default_timestamps_1080p60,st20p_default_timestamps_480p59_94,st20p_default_timestamps_576p50,st20p_default_timestamps_720p25,st20p_default_timestamps_720p50,st20p_default_timestamps_720p59_94,st20p_default_timestamps_2160p59_94,st20p_user_pacing,st20p_user_pacing_offset_jitter,st20p_exact_user_pacing,st20p_user_pacing_interlaced,st30p_user_pacing}"
 
 script_name=$(basename "${BASH_SOURCE[0]}")
 script_path=$(readlink -qe "${BASH_SOURCE[0]}")
@@ -75,6 +77,7 @@ XML_OUTPUT_DIR="${TMP_FOLDER}"
 mkdir -p "$XML_OUTPUT_DIR"
 
 test_count=0
+failed_count=0
 while IFS= read -r test_name || [ -n "$test_name" ]; do
 	if [[ -z "$test_name" || "$test_name" == \#* ]]; then
 		continue
@@ -84,15 +87,24 @@ while IFS= read -r test_name || [ -n "$test_name" ]; do
 	test_count=$((test_count + 1))
 	xml_file="${XML_OUTPUT_DIR}/noctx_${test_count}.xml"
 
-	if "$BUILD_PATH" \
-		--auto_start_stop \
-		--port_list="${PORT_LIST}" \
-		--gtest_filter="NoCtxTest.$test_name" \
-		--gtest_output="xml:${xml_file}" \
-		--no_ctx_tests; then
+	cmd=("$BUILD_PATH"
+		--auto_start_stop
+		--port_list="${PORT_LIST}"
+		--gtest_filter="NoCtxTest.$test_name"
+		--gtest_output="xml:${xml_file}"
+		--no_ctx_tests)
+	# The multicast groups follow the primary address, so a runner's own subnet keeps
+	# another host's NoCtx streams on a shared network out of these receivers.
+	[ -z "${TEST_P_SIP:-}" ] || cmd+=(--p_sip="${TEST_P_SIP}")
+	if [[ ",${NOCTX_ISOLATE_CASES}," == *",${test_name},"* ]]; then
+		cmd=(env MTL_ISOLATE="${MTL_ISOLATE:-try}" MTL_ISOLATE_PORTS="${PORT_LIST}"
+			"${mtl_folder}/tests/tools/isolate/isolate.sh" -- "${cmd[@]}")
+	fi
+	if "${cmd[@]}"; then
 		echo "Test NoCtxTest.$test_name passed"
 	else
 		echo "Test NoCtxTest.$test_name failed with exit code $?"
+		failed_count=$((failed_count + 1))
 		if [ "$EXIT_ON_FAILURE" -eq 1 ]; then
 			echo "Exiting due to test failure."
 			exit 1
@@ -108,4 +120,5 @@ while IFS= read -r test_name || [ -n "$test_name" ]; do
 done < <(echo "$test_names")
 
 echo "All noctx tests completed. XML files saved in $XML_OUTPUT_DIR"
-echo "Total test count: $test_count"
+echo "Total test count: $test_count, failed: $failed_count"
+[ "$failed_count" -eq 0 ]

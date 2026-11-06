@@ -6,7 +6,9 @@ import re
 import time
 
 import pytest
+from mfd_connect.exceptions import RemoteProcessTimeoutExpired
 from mfd_network_adapter import NetworkInterface
+from mtl_engine.dma import DSA_DEVICE_ID, setup_host_dma
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,24 @@ class Nicctl:
                 pci_id,
                 num_of_vfs,
             )
+            # VFs made before nicctl.sh set the RSS LUT have 16 queue pairs.
+            # Not fatal: a VF left at 16 fails only the cases that need more,
+            # with "fail to find free tx queue".
+            try:
+                res = self.connection.execute_command(
+                    f"sudo {self.nicctl} vf_rss_lut {pci_id}",
+                    shell=True,
+                    timeout=_NICCTL_TIMEOUT,
+                    expected_return_codes=None,
+                )
+                if res.return_code != 0:
+                    logger.warning(
+                        "nicctl.sh vf_rss_lut %s failed: %s",
+                        pci_id,
+                        (res.stderr or "").strip(),
+                    )
+            except RemoteProcessTimeoutExpired as e:
+                logger.warning("nicctl.sh vf_rss_lut %s timed out (%s)", pci_id, e)
             self.grant_vfio_access(existing)
             return existing
         cmd = "create_tvf" if trusted else "create_vf"
@@ -176,23 +196,47 @@ class Nicctl:
              kernel's documented escape hatch that does not wait on
              refcounts.
 
+        Only a timeout takes the escape hatch. A non-zero exit — the script
+        rejecting the BDF, a missing dpdk-devbind.py — means the PF
+        answered, so a PCI remove/rescan would be gratuitously
+        destructive: it re-probes the whole device, which invalidates the
+        VFs of every PF on that card and so breaks the *sibling* ports this
+        run is still using. Those failures propagate instead, because a PF
+        whose VFs could not be destroyed must not go on to be bound to
+        vfio-pci for exactly the reason ``bind_pmd`` documents.
+
         :param pci_id: pci_id of the nic adapter
         """
         self._wait_vfio_idle(pci_id, timeout_s=_VFIO_IDLE_TIMEOUT)
         try:
             self.connection.execute_command(
-                f"{self.nicctl} disable_vf {pci_id}",
+                f"sudo {self.nicctl} disable_vf {pci_id}",
                 shell=True,
                 timeout=_NICCTL_TIMEOUT,
             )
-            return
-        except Exception as e:
+        except RemoteProcessTimeoutExpired as e:
             logger.warning(
                 "disable_vf %s timed out (%s); attempting PCI remove/rescan",
                 pci_id,
                 e,
             )
             self._force_pci_reset(pci_id)
+        except Exception as e:
+            # Name the failure before it propagates -- it otherwise surfaces as
+            # a bare non-zero exit from a sudo command with no hint of which
+            # stage failed or why the escape hatch was not taken.
+            logger.warning(
+                "disable_vf %s failed (%s: %s); NOT attempting PCI "
+                "remove/rescan -- the PF answered, so a rescan would "
+                "re-probe the card and invalidate every sibling port's VFs. "
+                "Check that %s accepts this BDF and that dpdk-devbind.py is "
+                "present.",
+                pci_id,
+                type(e).__name__,
+                e,
+                self.nicctl,
+            )
+            raise
 
     def bind_pmd(self, pci_id: str) -> None:
         """Bind a PF/VF to the DPDK PMD driver (vfio-pci).
@@ -209,27 +253,44 @@ class Nicctl:
         if self.vfio_list(pci_id):
             self.disable_vf(pci_id)
         self.connection.execute_command(
-            self.nicctl + " bind_pmd " + pci_id,
+            f"sudo {self.nicctl} bind_pmd {pci_id}",
             shell=True,
             timeout=_NICCTL_TIMEOUT,
         )
 
     def bind_kernel(self, pci_id: str) -> None:
-        """Bind VF to kernel driver."""
+        """Bind VF to kernel driver.
+
+        As in :meth:`disable_vf`, only a timeout warrants the destructive
+        PCI remove/rescan.
+        """
         self._wait_vfio_idle(pci_id, timeout_s=_VFIO_IDLE_TIMEOUT)
         try:
             self.connection.execute_command(
-                self.nicctl + " bind_kernel " + pci_id,
+                f"sudo {self.nicctl} bind_kernel {pci_id}",
                 shell=True,
                 timeout=_NICCTL_TIMEOUT,
             )
-        except Exception as e:
+        except RemoteProcessTimeoutExpired as e:
             logger.warning(
                 "bind_kernel %s timed out (%s); attempting PCI remove/rescan",
                 pci_id,
                 e,
             )
             self._force_pci_reset(pci_id)
+        except Exception as e:
+            # As in :meth:`disable_vf`: the PF answered, so the escape hatch
+            # stays shut. Say so, and say what to look at.
+            logger.warning(
+                "bind_kernel %s failed (%s: %s); NOT attempting PCI "
+                "remove/rescan -- the PF answered, so a rescan would "
+                "re-probe the card and invalidate every sibling port's VFs. "
+                "Check that the VF is not still held by vfio-pci.",
+                pci_id,
+                type(e).__name__,
+                e,
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -302,6 +363,42 @@ class Nicctl:
             )
             self._iommu_group_cache[pci_id] = res.stdout.strip().rsplit("/", 1)[-1]
         return self._iommu_group_cache[pci_id]
+
+    def bind_dma(self, nic_pci_id: str) -> str | None:
+        """Bind a DMA (Intel DSA) channel on *nic_pci_id*'s own NUMA node to
+        vfio-pci, so RxTxApp sessions on it can be given one via --dma_dev
+        instead of silently falling back to a per-packet CPU copy
+        (rv_init_dma, doc/dma.md). Returns the channel's PCI address, or
+        None when this host serves none on that node.
+
+        DSA only, never setup_host_dma()'s CBDMA fallback: RxTxApp given a
+        CBDMA channel dies with SIGILL during EAL init on the i225 runner.
+
+        Delegates to mtl_engine.dma.setup_host_dma() rather than a bash
+        reimplementation: DSA's kernel driver (idxd) has a documented
+        use-after-free that can segfault the host on an unsafe unbind (see
+        _prepare_idxd_for_unbind() there), which that function avoids and a
+        bash version would not have.
+
+        Caller must invoke this before binding anything else on the NIC to
+        vfio-pci: on the first call on a given host (before the denylist
+        override persists), _prepare_idxd_for_unbind()'s modprobe reload of
+        vfio_pci detaches every device already bound to it, DSA or not --
+        calling this first means nothing else is bound yet to lose, and
+        whatever runs afterward (e.g. create_vfs()) establishes its own
+        bindings idempotently regardless of that churn.
+
+        Best-effort: called from the session-scoped host_dma_devices
+        fixture, which app_factory and nic_port_list depend on, so a
+        DMA-specific problem here must not fail session setup.
+        """
+        try:
+            return setup_host_dma(self.host, nic_pci_id, dma_config=DSA_DEVICE_ID)
+        except Exception as e:
+            logger.warning(
+                "bind_dma %s failed (%s: %s)", nic_pci_id, type(e).__name__, e
+            )
+            return None
 
     def prepare_vfs_for_test(self, nic: NetworkInterface) -> list:
         """Prepare VFs for test."""

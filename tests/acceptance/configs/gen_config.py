@@ -3,7 +3,8 @@
 # Copyright(c) 2026 Intel Corporation
 
 import argparse
-import subprocess
+import os
+import subprocess  # nosec B404 # runs lspci via an argv list, no shell
 
 import yaml
 
@@ -53,7 +54,12 @@ def gen_test_config(
         "media_path": media_path,
         "test_time": test_time,
         "ramdisk": {
-            "media": {"mountpoint": "/mnt/ramdisk/media", "size_gib": 16},
+            # A case stages one source here and records beside it, so 16 GiB is
+            # short: the largest source is 13.9 GiB, and an st20p recording runs
+            # up to the 8 GiB rx_max_file_size cap in
+            # mtl_engine/config/universal_params.py. 32 GiB is what the
+            # framework's other configs already document.
+            "media": {"mountpoint": "/mnt/ramdisk/media", "size_gib": 32},
             "tmpfs_size_gib": 8,
         },
     }
@@ -245,7 +251,10 @@ def main() -> None:
     # Optional EBU args
     parser.add_argument("--ebu_ip", type=str, default=None)
     parser.add_argument("--ebu_user", type=str, default=None)
-    parser.add_argument("--ebu_password", type=str, default=None)
+    # The environment keeps the password off the command line, where ps shows it.
+    parser.add_argument(
+        "--ebu_password", type=str, default=os.environ.get("EBU_PASSWORD")
+    )
     # Optional test settings
     parser.add_argument("--test_time", type=int, default=60)
     parser.add_argument("--media_path", type=str, default="/mnt/media")

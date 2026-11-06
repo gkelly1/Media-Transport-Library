@@ -7,10 +7,26 @@ import pytest
 from common.nicctl import InterfaceSetup
 from mtl_engine.const import LOG_FOLDER
 from mtl_engine.media_files import audio_files
+from tests.xfail import add_issue
 
 _AUDIO_FORMATS = ["PCM8", "PCM16", "PCM24"]
 _AUDIO_CHANNELS = ["M", "DM", "ST", "LtRt", "51", "71", "222", "SGRP"]
 _SMOKE_CASE = ("PCM16", "M")
+# The low-bandwidth leg (i225) runs one row per audio format and one per
+# application, with no format and no application twice.
+_LOW_BANDWIDTH_ROWS = {("PCM8", "rxtxapp"), ("PCM16", "gstreamer"), ("PCM24", "ffmpeg")}
+
+
+def _format_marks(fmt, app):
+    """Markers of one (format, application) row of test_st30p_format."""
+    marks = []
+    # One GStreamer row smoke-tests the mtl_st30p elements; each row costs a
+    # smoke leg 74-110 s.
+    if app != "gstreamer" or fmt == "PCM16":
+        marks.append(pytest.mark.smoke)
+    if (fmt, app) in _LOW_BANDWIDTH_ROWS:
+        marks.append(pytest.mark.low_bandwidth)
+    return marks
 
 
 @pytest.mark.nightly
@@ -24,6 +40,7 @@ _SMOKE_CASE = ("PCM16", "M")
                 reason="FFmpeg does not support st30p audio pipeline"
             ),
         ),
+        "gstreamer",
     ],
 )
 @pytest.mark.parametrize(
@@ -82,25 +99,27 @@ def test_st30p_integrity(
     )
 
 
+# Explicit ids spell ``application`` the way pytest_mfd_logging does: the
+# combined report reads the app from that token.
 @pytest.mark.nightly
 @pytest.mark.parametrize(
-    "application",
-    [
-        "rxtxapp",
-        "ffmpeg",
-    ],
-)
-@pytest.mark.parametrize(
-    ("media_file", "audio_channel"),
+    ("application", "media_file", "audio_channel"),
     [
         pytest.param(
+            app,
             audio_files[fmt],
             ch,
-            marks=[pytest.mark.smoke] if (fmt, ch) == _SMOKE_CASE else [],
-            id=f"{fmt}-{ch}",
+            # GStreamer's smoke row is test_st30p_format's.
+            marks=(
+                [pytest.mark.smoke]
+                if (fmt, ch) == _SMOKE_CASE and app != "gstreamer"
+                else []
+            ),
+            id=f"{fmt}-{ch}-|application = {app}|",
         )
         for fmt in _AUDIO_FORMATS
         for ch in _AUDIO_CHANNELS
+        for app in ("rxtxapp", "ffmpeg", "gstreamer")
     ],
     indirect=["media_file"],
 )
@@ -124,6 +143,9 @@ def test_st30p_channel(
 
     if media_file_info["format"] in ["PCM16", "PCM24"] and audio_channel == "222":
         pytest.skip("Unsupported parameter combination")
+    # The mtl_st30p_{tx,rx} caps are channels = [1, 8].
+    if application == "gstreamer" and audio_channel == "222":
+        pytest.skip("GStreamer st30p plugin supports up to 8 channels")
 
     host = list(hosts.values())[0]
     interfaces_list = setup_interfaces.get_interfaces_list_single(
@@ -156,25 +178,20 @@ def test_st30p_channel(
     )
 
 
-@pytest.mark.smoke
-@pytest.mark.low_bandwidth
 @pytest.mark.nightly
 @pytest.mark.parametrize(
-    "application",
+    ("application", "media_file"),
     [
-        "rxtxapp",
-        "ffmpeg",
-    ],
-)
-@pytest.mark.parametrize(
-    "media_file",
-    [
-        audio_files["PCM8"],
-        audio_files["PCM16"],
-        audio_files["PCM24"],
+        pytest.param(
+            app,
+            audio_files[fmt],
+            marks=_format_marks(fmt, app),
+            id=f"{fmt}-|application = {app}|",
+        )
+        for fmt in _AUDIO_FORMATS
+        for app in ("rxtxapp", "ffmpeg", "gstreamer")
     ],
     indirect=["media_file"],
-    ids=["PCM8", "PCM16", "PCM24"],
 )
 @pytest.mark.tx_and_rx
 def test_st30p_format(
@@ -229,6 +246,7 @@ def test_st30p_format(
     [
         "rxtxapp",
         "ffmpeg",
+        "gstreamer",
     ],
 )
 @pytest.mark.parametrize(
@@ -256,11 +274,19 @@ def test_st30p_ptime(
     pcap_capture,
     output_files,
     media_integrity,
+    request,
 ):
     """Test st30p with different ptime values."""
     # FFmpeg mtl_st30p plugin only supports ptime "1ms" and "125us".
     if application == "ffmpeg" and audio_ptime not in ("1", "0.12"):
         pytest.skip(f"FFmpeg st30p plugin does not support ptime={audio_ptime}")
+    # libmtl: st30 RL rate profiling leaves RL queue 0 backlogged, so the TX reorders
+    # its first frames; GStreamer loses more of them than the integrity check tolerates.
+    if application == "gstreamer" and audio_ptime == "0.33":
+        add_issue(
+            "XFAIL: st30 RL TX reorders its first frames after rate profiling",
+            request,
+        )
 
     media_file_info, media_file_path = media_file
     host = list(hosts.values())[0]
@@ -300,6 +326,7 @@ def test_st30p_ptime(
     [
         "rxtxapp",
         "ffmpeg",
+        "gstreamer",
     ],
 )
 @pytest.mark.parametrize(
@@ -367,6 +394,7 @@ def test_st30p_sampling(
     [
         "rxtxapp",
         "ffmpeg",
+        "gstreamer",
     ],
 )
 @pytest.mark.parametrize(

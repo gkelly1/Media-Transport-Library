@@ -6,6 +6,42 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# How long to wait for LIST to analyze an uploaded PCAP.
+REPORT_WAIT_S = 60
+
+# How many seconds a re-analysis gets to publish a report distinct from the one
+# it replaces. Measured at 3 ms on an idle EBU LIST 2.2.2; the margin is for a
+# loaded one, and the wait ends as soon as the new report appears.
+REANALYSIS_TIMEOUT = 10
+
+# How many seconds EBU LIST gets to re-analyse one stream and answer the PUT
+# that asked for it. Measured at 0.4 s for a 4 s audio capture. The answer can
+# also never come: LIST 2.2.2 only logs an exception its audio analysis raises.
+STREAM_REANALYSIS_TIMEOUT = 60
+
+
+def no_verdict_reason(report):
+    """Return why *report* carries no compliance verdict, or None if it has one.
+
+    Neither shape may fall through to the ordinary verdict: an analyzed report
+    with no streams has ``not_compliant_streams == 0``, which would otherwise
+    read as "compliant" about a capture that held nothing to judge.
+    """
+    if not report:
+        return (
+            "EBU LIST report is unavailable or was never analyzed, so compliance "
+            "was not evaluated."
+        )
+    if not report.get("streams"):
+        return (
+            "EBU LIST analyzed the capture but found no ST 2110 streams in it, so "
+            "there was no compliance verdict to give. Most often the transmitter "
+            "was not running for the capture window, the sniffer port does not "
+            "see the stream, or the capture filter's destination IP does not "
+            "match it."
+        )
+    return None
+
 
 class PcapComplianceClient:
     def __init__(
@@ -75,66 +111,151 @@ class PcapComplianceClient:
             raise Exception("Upload failed: No UUID received.")
         return self.pcap_id
 
-    def download_report(self, retries=10):
+    def download_report(self, wait_s=REPORT_WAIT_S):
         """
         Download the compliance report for the uploaded PCAP file.
-        returns the report as a JSON object.
+        returns the report as a JSON object, or False if LIST has not analyzed
+        the PCAP within *wait_s* seconds.
+
+        LIST analyzes an idle PCAP in about a second, but it is shared by every
+        runner, so a busy one can take far longer: the wait backs off from 1 s
+        to 10 s between polls, until *wait_s* has passed.
         """
         if not self.pcap_id:
             raise ValueError("No PCAP ID available to download report.")
-        if retries is None or retries <= 0:
-            logger.error(
-                "Invalid retries value (%s), skipping compliance check", retries
-            )
-            return False
         url = f"http://{self.ebu_ip}/api/pcap/{self.pcap_id}/report?type=json"
         headers = {"Authorization": f"Bearer {self.token}"}
-        initial_retries = retries
-        while retries > 0:
-            response = self.session.get(
-                url, headers=headers, verify=False, proxies=self.proxies
-            )
-
-            # EBU LIST may return 404 until the report is generated.
-            if response.status_code == 404:
-                time.sleep(1)
-                retries -= 1
-                continue
-
-            response.raise_for_status()
-            report = response.json()
-            if report.get("analyzed", False):
-                return report
-
-            time.sleep(1)
-            retries -= 1
+        start = time.monotonic()
+        deadline = start + wait_s
+        delay = 1
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                response = self.session.get(
+                    url,
+                    headers=headers,
+                    verify=False,
+                    proxies=self.proxies,
+                    timeout=max(1, min(10, deadline - time.monotonic())),
+                )
+                # EBU LIST may return 404 until the report is generated.
+                if response.status_code != 404:
+                    response.raise_for_status()
+                    report = response.json()
+                    if report.get("analyzed", False):
+                        return report
+            except (requests.ConnectionError, requests.Timeout) as e:
+                logger.warning("EBU LIST report poll %d failed: %s", attempts, e)
+            if time.monotonic() + delay > deadline:
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, 10)
 
         logger.error(
-            "Report is unavailable or not analyzed after %s attempts",
-            initial_retries,
+            "Report is unavailable or not analyzed after %d attempts in %.0f s",
+            attempts,
+            time.monotonic() - start,
         )
         return False
 
-    def check_compliance(self, report=None):
+    def reanalyze(self, previous=None):
+        """Re-run the analysis on the PCAP already held by the server.
+
+        EBU LIST queues its stream pre-processor a path without waiting for the
+        upload to reach disk, so a busy analyser can read zero packets and still
+        mark the PCAP analyzed. That empty report is terminal -- polling longer
+        cannot improve it -- but the uploaded file is complete, so re-analyzing
+        it in place recovers the streams without transferring the capture again.
+
+        *previous* is the report being replaced, used to tell the fresh one
+        apart from it. Returns the report of the fresh analysis, in the same
+        shape :meth:`download_report` returns.
+        """
+        if not self.pcap_id:
+            raise ValueError("No PCAP ID available to reanalyze.")
+        url = f"http://{self.ebu_ip}/api/pcap/{self.pcap_id}/reanalyze"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        response = self.session.put(
+            url, headers=headers, verify=False, proxies=self.proxies
+        )
+        response.raise_for_status()
+        # The pre-processor clears ``analyzed`` when it claims the request, but
+        # not necessarily before the first poll, so a poll can still return the
+        # report being replaced. The fresh one is told apart by capture_date,
+        # which a dropped ingest leaves at 0 and a real analysis fills in. If
+        # none ever appears the capture really holds no stream, and the report
+        # in hand is the right answer -- so this waits, it does not fail.
+        stale = (previous or {}).get("capture_date")
+        report = self.download_report()
+        for _ in range(REANALYSIS_TIMEOUT):
+            if not report or report.get("capture_date") != stale:
+                break
+            time.sleep(1)
+            report = self.download_report()
+        return report
+
+    def reanalyze_audio(self, report, media_specific):
+        """Re-analyse each audio stream of *report* as *media_specific*.
+
+        An audio packet does not carry its sampling rate, so EBU LIST assumes
+        48 kHz and derives the packet time from that: it reads a 96 kHz stream
+        as 2 ms packets and fails its TS-DF, packet interval and RTP timestamp
+        checks on a clock running at half the real rate. This sends the
+        correction LIST's own "stream needs info" dialog sends, and LIST
+        replies only once it has re-analysed the stream.
+
+        Returns the fresh report, or *report* when LIST already read every
+        audio stream as *media_specific*.
+        """
+        url = f"http://{self.ebu_ip}/api/pcap/{self.pcap_id}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        # The stream documents as stored, which the PUT below replaces whole.
+        # LIST's per-stream GET answers 404 for an audio stream.
+        response = self.session.get(
+            f"{url}/streams/", headers=headers, verify=False, proxies=self.proxies
+        )
+        response.raise_for_status()
+        misread = [
+            stream
+            for stream in response.json()
+            if stream.get("media_type") == "audio"
+            and stream.get("media_specific") != media_specific
+        ]
+        for stream in misread:
+            logger.info(
+                "EBU LIST read audio stream %s as %s; re-analysing it as %s",
+                stream["id"],
+                stream.get("media_specific"),
+                media_specific,
+            )
+            stream["media_specific"] = media_specific
+            # LIST picks the audio analyser by this, not by media_specific.
+            stream["full_media_type"] = f"audio/{media_specific['encoding']}"
+            response = self.session.put(
+                f"{url}/stream/{stream['id']}/help",
+                headers=headers,
+                json=stream,
+                verify=False,
+                proxies=self.proxies,
+                timeout=STREAM_REANALYSIS_TIMEOUT,
+            )
+            response.raise_for_status()
+        # No poll, unlike reanalyze(): pi-list's api/pcap.js answers this PUT
+        # only after pcapSingleStreamIngest has stored the re-analysis.
+        return self.download_report() if misread else report
+
+    def check_compliance(self, report):
         """
         Check the compliance result from the downloaded report.
-        Returns True if compliant, False otherwise.
+        Returns ``(verdict, report)``, the verdict being True if compliant,
+        False if non-compliant, and None when the report carries no verdict at
+        all -- see :func:`no_verdict_reason`.
         """
-        if report is None:
-            report = self.download_report()
-
-        # download_report() may return False on failure/timeout
-        if not report:
-            logger.error("Compliance report is unavailable or not analyzed")
+        if no_verdict_reason(report):
             return None, report
 
-        streams = report.get("streams") or []
-        if not streams:
-            logger.warning(
-                "Compliance report contains no streams; treating as non-compliant"
-            )
-            return False, report
-
+        streams = report["streams"]
         not_compliant_streams = report.get("not_compliant_streams", 1)
         unknown_media_streams = [
             (idx, stream)

@@ -11,7 +11,7 @@ on:
       - main
       - 'maint-**'
 
-# Same reason as the other build workflows: four images per run, and only the
+# Same reason as the other build workflows: five images per run, and only the
 # newest commit's are of any use.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -33,21 +33,24 @@ jobs:
     permissions:
       pull-requests: read
     outputs:
-      ubuntu_build: ${{ steps.filter.outputs.ubuntu_build == 'true' }}
-      manager_build: ${{ steps.filter.outputs.manager_build == 'true' }}
+      docker_build: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.docker_build == 'true' }}
+      manager_build: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.manager_build == 'true' }}
+      docker_compose: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.docker_compose == 'true' }}
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         with:
           filters: .github/path_filters.yml
 
   ubuntu-docker-build:
     needs: changes
+    if: needs.changes.outputs.docker_build == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     permissions:
@@ -63,30 +66,30 @@ jobs:
           - name: ubuntu24
             dockerfile: docker/ubuntu24.dockerfile
             image_suffix: "-ubuntu24"
+          - name: ubuntu26
+            dockerfile: docker/ubuntu26.dockerfile
+            image_suffix: "-ubuntu26"
           - name: rocky9
             dockerfile: docker/rocky9.dockerfile
             image_suffix: "-rocky9"
     steps:
       - name: Harden Runner
-        if: ${{ needs.changes.outputs.ubuntu_build == 'true' }}
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: audit
       - name: Checkout repository
-        if: ${{ needs.changes.outputs.ubuntu_build == 'true' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        if: ${{ needs.changes.outputs.ubuntu_build == 'true' }}
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           buildkitd-flags: "--debug --allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host"
           platforms: "linux/amd64/v4"
           driver-opts: memory=14Gib,memory-swap=25Gib,env.BUILDKIT_STEP_LOG_MAX_SIZE=50000000,env.BUILDKIT_STEP_LOG_MAX_SPEED=10000000
 
       - name: Login to Docker Container Registry
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
-        if: ${{ needs.changes.outputs.ubuntu_build == 'true' && env.DOCKER_REGISTRY_LOGIN == 'true' }}
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        if: ${{ env.DOCKER_REGISTRY_LOGIN == 'true' }}
         id: dockerLoginStep
         continue-on-error: true
         with:
@@ -95,18 +98,23 @@ jobs:
           password: "${{ secrets.GITHUB_TOKEN }}"
 
       - name: Build image (${{ matrix.name }})
-        if: ${{ needs.changes.outputs.ubuntu_build == 'true' }}
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           push: "${{ env.DOCKER_REGISTRY_LOGIN == 'true' && steps.dockerLoginStep.outcome == 'SUCCESS' && github.ref == 'refs/heads/main' }}"
           context: "${{ github.workspace }}"
           file: "${{ github.workspace }}/${{ matrix.dockerfile }}"
           tags: "${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_PREFIX }}/${{ env.DOCKER_IMAGE_NAME }}${{ matrix.image_suffix }}:${{ env.DOCKER_IMAGE_TAG }}"
           cache-from: "type=gha,scope=${{ env.DOCKER_IMAGE_NAME }}-${{ matrix.name }}"
-          cache-to: "type=gha,scope=${{ env.DOCKER_IMAGE_NAME }}-${{ matrix.name }},mode=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'min' }}"
+          # Main only: the layers of a pull request push the caches of main out
+          # of the 10 GB of the repository.
+          cache-to: "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && format('type=gha,scope={0}-{1},mode=max', env.DOCKER_IMAGE_NAME, matrix.name) || '' }}"
+          # The final stage is what ships: rebuild it every time, so it installs
+          # the packages the archive serves today, not those of a cached layer.
+          no-cache-filters: final
 
   manager-docker-build:
     needs: changes
+    if: needs.changes.outputs.manager_build == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     permissions:
@@ -116,15 +124,15 @@ jobs:
       DOCKER_IMAGE_NAME: mtl-manager
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: audit
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           buildkitd-flags: "--debug --allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host"
           platforms: "linux/amd64/v4"
@@ -136,7 +144,7 @@ jobs:
         run: echo "VERSION=$(cat VERSION)">> "$GITHUB_OUTPUT"
 
       - name: Login to Docker Container Registry
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: ${{ env.DOCKER_REGISTRY_LOGIN == 'true' }}
         id: dockerLoginStep
         continue-on-error: true
@@ -146,13 +154,52 @@ jobs:
           password: "${{ secrets.GITHUB_TOKEN }}"
 
       - name: Build manager image
-        if: ${{ needs.changes.outputs.ubuntu_build == 'true' }}
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           push: "${{ env.DOCKER_REGISTRY_LOGIN == 'true' && steps.dockerLoginStep.outcome == 'SUCCESS' && github.ref == 'refs/heads/main' }}"
-          context: "${{ github.workspace }}/manager"
+          context: "${{ github.workspace }}"
           file: "${{ github.workspace }}/manager/Dockerfile"
           tags: "${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_PREFIX }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_IMAGE_TAG }}"
           cache-from: "type=gha,scope=${{ env.DOCKER_IMAGE_NAME }}"
-          cache-to: "type=gha,scope=${{ env.DOCKER_IMAGE_NAME }},mode=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'min' }}"
+          # Main only: the layers of a pull request push the caches of main out
+          # of the 10 GB of the repository.
+          cache-to: "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && format('type=gha,scope={0},mode=max', env.DOCKER_IMAGE_NAME) || '' }}"
+          # The final stage is what ships: rebuild it every time, so it installs
+          # the packages the archive serves today, not those of a cached layer.
+          no-cache-filters: final
           build-args: VERSION=${{ steps.version.outputs.VERSION }}
+
+  compose-validate:
+    needs: changes
+    if: needs.changes.outputs.docker_compose == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate default Compose configuration
+        run: docker compose -f docker/docker-compose.yml config --quiet
+      - name: Validate AF_XDP Compose configuration
+        env:
+          MTL_VARIANT: ubuntu24
+        run: |
+          config=$(docker compose -f docker/docker-compose.yml -f docker/docker-compose.xdp.yml config)
+          if grep -Fq /dev/vfio <<< "$config"; then
+            echo "AF_XDP Compose configuration must not use VFIO" >&2
+            exit 1
+          fi
+
+  # The one check to require in branch protection. It always runs, so it
+  # reports even when the path filter skips docker builds, and it fails only if a
+  # job it needs failed or was cancelled.
+  docker-build-result:
+    name: docker-build-result
+    needs: [changes, ubuntu-docker-build, manager-docker-build, compose-validate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All docker builds ok
+        if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+        run: exit 0
+      - name: Some docker builds failed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1

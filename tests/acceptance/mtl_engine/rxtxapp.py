@@ -11,12 +11,16 @@ import re
 from mfd_connect import SSHConnection
 
 from . import ip_pools
-from .application_base import MTL_ENCODER_PLUGIN_MAP, Application, mtl_plugin_check_cmd
+from .application_base import Application, st22_codec_devices_ok
 from .config.mappings import APP_NAME_MAP, RXTXAPP_CMDLINE_PARAM_MAP
 from .config.universal_params import UNIVERSAL_PARAMS
+from .const import ISOLATE_SH
 from .execute import log_fail
+from .integrity_session import IntegrityIntent
 
 logger = logging.getLogger(__name__)
+
+PCI_BDF_RE = re.compile(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]")
 
 
 # ============================================================================
@@ -282,8 +286,6 @@ def check_rx_output(
         pattern = re.compile(r"app_rx_st30p_result")
     elif session_type == "st40p":
         pattern = re.compile(r"app_rx_st40p_result")
-    elif session_type == "fastmetadata":
-        pattern = re.compile(r"app_rx_fmd_result")
     elif session_type == "video":
         pattern = re.compile(r"app_rx_video_result")
     elif session_type == "audio":
@@ -420,80 +422,6 @@ def check_rx_converter_output(
     return False
 
 
-def check_codec_loaded(
-    output: list,
-    session_type: str,
-    fail_on_error: bool = False,
-) -> bool:
-    """Check if codec/plugin was loaded successfully for ST22P sessions.
-
-    For ST22P sessions, the encoder/decoder must be registered before the session
-    can work. This function checks the log output for registration messages.
-
-    Log patterns to look for:
-    - "st22_encoder_register(...), ... registered, device ..."
-    - "st22_decoder_register(...), ... registered, device ..."
-    - "st_plugin_register(...), ... registered, version ..."
-    - "encoder use block get mode" (indicates encoder is active)
-    - "decoder use block get mode" (indicates decoder is active)
-
-    Args:
-        output: List of output lines from RxTxApp
-        session_type: Session type (should be "st22p" for codec checks)
-        fail_on_error: Whether to call log_fail on validation failure
-
-    Returns:
-        True if codec was loaded, False otherwise
-    """
-    if session_type != "st22p":
-        # Codec check only applies to st22p
-        return True
-
-    logger.info("Checking if ST22P codec/encoder/decoder was loaded")
-
-    # Patterns indicating successful codec loading
-    codec_patterns = [
-        r"st22_encoder_register\(\d+\),.*registered",
-        r"st22_decoder_register\(\d+\),.*registered",
-        r"st_plugin_register\(\d+\),.*registered",
-        r"encoder use block get mode",
-        r"decoder use block get mode",
-    ]
-
-    found_encoder = False
-    found_decoder = False
-
-    for line in output:
-        for pattern in codec_patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                logger.info(f"Found codec registration: {line.strip()}")
-                if "encoder" in line.lower():
-                    found_encoder = True
-                if "decoder" in line.lower():
-                    found_decoder = True
-
-    # Both encoder and decoder should be loaded for a proper st22p session
-    if found_encoder and found_decoder:
-        logger.info("ST22P codec check PASSED: encoder and decoder loaded")
-        return True
-
-    if found_encoder or found_decoder:
-        logger.warning(
-            f"ST22P codec partially loaded: encoder={found_encoder}, decoder={found_decoder}"
-        )
-        # Partial load may still work in some configurations
-        return True
-
-    # No codec found
-    msg = "ST22P codec check FAILED: no encoder/decoder registration found in logs"
-    if fail_on_error:
-        log_fail(msg)
-    else:
-        logger.warning(msg)
-
-    return False
-
-
 class RxTxApp(Application):
     """RxTxApp framework implementation (unified model)."""
 
@@ -502,20 +430,6 @@ class RxTxApp(Application):
 
     def get_executable_name(self) -> str:
         return APP_NAME_MAP["rxtxapp"]
-
-    def require_encoder(self, host, encoder: str, use_mtl_plugin: bool = False) -> None:
-        """Raise EnvironmentError if the MTL codec plugin for *encoder* is not installed."""
-        plugin_so = MTL_ENCODER_PLUGIN_MAP.get(encoder)
-        if not plugin_so:
-            return  # Unknown encoder — skip check, let runtime fail if needed
-        res = host.connection.execute_command(
-            mtl_plugin_check_cmd(plugin_so), shell=True, expected_return_codes=None
-        )
-        if res.return_code != 0:
-            raise EnvironmentError(
-                f"MTL codec plugin {plugin_so} (for {encoder}) not found; "
-                f"install the codec library and rebuild MTL plugins"
-            )
 
     # Per-session-type (default UDP port, default payload type). Mirrors the
     # legacy ``add_*_sessions`` helpers; without it every type ends up on
@@ -528,7 +442,6 @@ class RxTxApp(Application):
         "st30p": (30000, 111),
         "ancillary": (40000, 113),
         "st40p": (40000, 113),
-        "fastmetadata": (40000, 115),
     }
 
     @classmethod
@@ -561,6 +474,8 @@ class RxTxApp(Application):
         per-session dict so callers do not have to repeat them.
         """
         sessions = kwargs.pop("sessions", None)
+        # Every session's own params, for _rx_recordings(); empty when single.
+        self._session_params = []
         if sessions is None:
             return super().create_command(**kwargs)
 
@@ -587,6 +502,7 @@ class RxTxApp(Application):
         # so per-type defaults (FPS, payload size, etc.) are applied; we
         # then move the populated arrays into the base config.
         saved_params = dict(self.params)
+        self._session_params = [saved_params]
         try:
             for spec in sessions[1:]:
                 if not spec.get("session_type"):
@@ -597,6 +513,7 @@ class RxTxApp(Application):
                 stype = merged["session_type"]
                 self.params = UNIVERSAL_PARAMS.copy()
                 self.set_params(**merged)
+                self._session_params.append(self.params)
                 tmp_config = self._create_rxtxapp_config_dict()
                 _extend("tx_sessions", tmp_config, stype)
                 _extend("rx_sessions", tmp_config, stype)
@@ -618,9 +535,8 @@ class RxTxApp(Application):
         config_file_path = self.config_file_path or "tests/config.json"
 
         # Build command line
-        # Note: sudo is NOT needed because the test framework already runs as root
-        # (see README.md: "MTL validation must run as root user").
-        # Subprocesses inherit root privileges from the parent pytest process.
+        # No sudo: RxTxApp runs as the SSH account, which may be unprivileged
+        # (doc/ci_runner_setup.md). add_timeout adds sudo for cpu_isolation.
         cmd_parts = [
             self.get_executable_path(),
             "--config_file",
@@ -648,6 +564,53 @@ class RxTxApp(Application):
                     cmd_parts.extend([rxtx_param, str(value)])
 
         return " ".join(cmd_parts), self._create_rxtxapp_config_dict()
+
+    def add_timeout(self, command: str, test_time: int, grace: int = None) -> str:
+        """Wrap command with timeout, and in isolate.sh when ``cpu_isolation`` is set::
+
+            sudo -n timeout <T+grace> env MTL_ISOLATE=require MTL_ISOLATE_PORTS=<BDFs>
+            tests/tools/isolate/isolate.sh -- setpriv --reuid=$(id -u) ... <command>
+
+        setpriv runs RxTxApp as the SSH account again. The timeout is not raised:
+        past process_timeout_buffer, the Python wait would give up first.
+        """
+        isolation = self.params.get("cpu_isolation")
+        if isolation is None:
+            return super().add_timeout(command, test_time, grace)
+        if isolation != "require":
+            raise ValueError(f"cpu_isolation={isolation!r}, expected None or 'require'")
+        isolated = (
+            f"env MTL_ISOLATE=require MTL_ISOLATE_PORTS={self._isolate_ports()} "
+            f"{ISOLATE_SH} -- setpriv --reuid=$(id -u) --regid=$(id -g) "
+            f"--init-groups {command}"
+        )
+        return "sudo -n " + super().add_timeout(isolated, test_time, grace)
+
+    def _isolate_ports(self) -> str:
+        """The config's interface BDFs in order, port P first, without repeats."""
+        ports = list(dict.fromkeys(i["name"] for i in self.config["interfaces"]))
+        for name in ports:
+            if not PCI_BDF_RE.fullmatch(name):
+                raise ValueError(
+                    f"cpu_isolation needs PCI BDF interfaces, got {name!r}"
+                )
+        return ",".join(ports)
+
+    @staticmethod
+    def _rc_failure(rc: int, output_lines: list) -> str:
+        """Message for a failing rc: isolate.sh's error, a timeout, then sudo's error."""
+
+        def line_with(marker):
+            return next(
+                (ln.strip() for ln in output_lines if ln.startswith(marker)), None
+            )
+
+        return (
+            line_with("isolate.sh: ERROR")
+            or ("timed out (rc 124)" if rc == 124 else None)
+            or line_with("sudo:")
+            or f"Process return code {rc} indicates failure"
+        )
 
     # Sentinel for ``_p`` so callers can pass ``None`` as an explicit default.
     _PARAM_UNSET = object()
@@ -677,7 +640,7 @@ class RxTxApp(Application):
         Returns:
             Complete RxTxApp configuration dictionary
         """
-        # Currently only st20p/st22p/st30p/video/audio/ancillary/fastmetadata supported
+        # Currently only st20p/st22p/st30p/video/audio/ancillary supported
         # We rebuild the legacy shell for all session types but only populate the active one.
 
         session_type = self.params.get("session_type", UNIVERSAL_PARAMS["session_type"])
@@ -981,6 +944,17 @@ class RxTxApp(Application):
                     session["ancillary_format"] = p("ancillary_format")
                     session["ancillary_url"] = p("ancillary_url")
                     session["ancillary_fps"] = p("ancillary_fps")
+                if p("fast_metadata"):
+                    # ST2110-41 opt-in. RX checks DIT/K-bit and compares every
+                    # data item against ancillary_url, the file TX sends.
+                    session.update(
+                        fast_metadata=True,
+                        fastmetadata_data_item_type=p(
+                            "fastmetadata_data_item_type", cast=int
+                        ),
+                        fastmetadata_k_bit=p("fastmetadata_k_bit", cast=int),
+                        ancillary_url=p("ancillary_url"),
+                    )
                 return session
 
             if session_type == "st30p":
@@ -994,32 +968,18 @@ class RxTxApp(Application):
                 session["audio_url"] = p("input_file") if is_tx else p("output_file")
                 return session
 
-            if session_type == "fastmetadata":
-                session = {
-                    **_hdr(),
-                    "fastmetadata_data_item_type": p(
-                        "fastmetadata_data_item_type", cast=int
-                    ),
-                    "fastmetadata_k_bit": p("fastmetadata_k_bit", cast=int),
-                }
-                if is_tx:
-                    session["type"] = p("type_mode")
-                    session["fastmetadata_fps"] = p("fastmetadata_fps")
-                    session["fastmetadata_url"] = p("input_file")
-                else:
-                    session["fastmetadata_url"] = p("output_file")
-                return session
-
             if session_type == "st40p":
                 # st40p (ancillary pipeline) — port/pt default to 40000/113;
                 # mirrors add_st40p_sessions() in legacy RxTxApp.py.
                 session = {
                     **_hdr(port_default=40000, pt_default=113),
+                    # RX needs the fps too: it is the expected rate the C-side
+                    # ST_APP_EXPECT_NEAR gate validates the measured fps against.
+                    "fps": self.params.get("fps", p("framerate")),
                     "interlaced": p("interlaced"),
                     "enable_rtcp": p("enable_rtcp"),
                 }
                 if is_tx:
-                    session["fps"] = self.params.get("fps", p("framerate"))
                     session["st40p_url"] = self.params.get("st40p_url", p("input_file"))
                 return session
 
@@ -1115,6 +1075,14 @@ class RxTxApp(Application):
             f"--config_file {config_file_relative}", f"--config_file {config_file_path}"
         )
 
+        has_st22p = any(
+            entry.get("st22p")
+            for direction in ("tx_sessions", "rx_sessions")
+            for entry in self.config.get(direction) or []
+        )
+        if has_st22p:
+            self.command = self.with_local_kahawai(self.command, build)
+
     def validate_results(self, fail_on_error: bool = True) -> bool:  # type: ignore[override]
         """
         Validate execution results exactly like original RxTxApp.execute_test().
@@ -1147,6 +1115,12 @@ class RxTxApp(Application):
             if not self.config:
                 _fail("RxTxApp validate_results called without config")
 
+            if self.params.get("cpu_isolation"):
+                for line in (self.last_output or "").split("\n"):
+                    if "isolate.sh: exclusive CPU isolation of" in line:
+                        logger.info(line.strip())
+                        break
+
             # Multi-session aware: when more than one session type is populated
             # (e.g. kernel_lo / xdp / rx_timing/mixed run st20p+st30p+ancillary
             # in a single RxTxApp invocation), validate every type sequentially.
@@ -1155,7 +1129,7 @@ class RxTxApp(Application):
                 output_lines = self.last_output.split("\n") if self.last_output else []
                 rc = self.last_return_code
                 if rc not in (0, None):
-                    _fail(f"Process return code {rc} indicates failure")
+                    _fail(self._rc_failure(rc, output_lines))
                 for stype in all_types:
                     if not self._validate_single_session_type(stype, output_lines):
                         _fail(f"{stype} validation failed (multi-session)")
@@ -1169,7 +1143,7 @@ class RxTxApp(Application):
 
             # 1. Check return code (must be 0 or None for dual-host secondary)
             if rc not in (0, None):
-                _fail(f"Process return code {rc} indicates failure")
+                _fail(self._rc_failure(rc, output_lines))
 
             # 2. Validate based on session type. Single- and multi-session
             #    paths share the same per-type dispatch via
@@ -1198,7 +1172,7 @@ class RxTxApp(Application):
         legacy ``RxTxApp.execute_test()``:
 
         - ``st20p``: RX output + TX/RX converter outputs (no plain TX check).
-        - ``st22p``/``st30p``/``st40p``/``fastmetadata``/``ancillary``: RX
+        - ``st22p``/``st30p``/``st40p``/``ancillary``: RX
           output only. ST22P additionally logs a warning if
           codec/encoder/decoder did not load, but does not fail on it (codecs
           may register lazily).
@@ -1210,14 +1184,17 @@ class RxTxApp(Application):
                 and check_tx_converter_output(self.config, output_lines, "st20p", False)
                 and check_rx_converter_output(self.config, output_lines, "st20p", False)
             )
-        if session_type in ("st22p", "st30p", "st40p", "fastmetadata", "ancillary"):
+        if session_type in ("st22p", "st30p", "st40p", "ancillary"):
             rx_session_type = "anc" if session_type == "ancillary" else session_type
             ok = check_rx_output(self.config, output_lines, rx_session_type, False)
-            if session_type == "st22p" and not check_codec_loaded(
-                output_lines, session_type, False
-            ):
-                logger.warning(
-                    "ST22P codec loading check failed - encoder/decoder may not be registered"
+            if session_type == "st22p":
+                ok = (
+                    st22_codec_devices_ok(
+                        "\n".join(output_lines),
+                        self.params.get("codec", "JPEG-XS"),
+                        ("encoder", "decoder"),
+                    )
+                    and ok
                 )
             return ok
         # video / audio / unknown -> TX + RX
@@ -1237,7 +1214,6 @@ class RxTxApp(Application):
         "st20p",
         "st30p",
         "st40p",
-        "fastmetadata",
         "video",
         "audio",
         "ancillary",
@@ -1278,6 +1254,83 @@ class RxTxApp(Application):
             for group in (self.config or {}).get("rx_sessions") or []
             for session in group.get("st20p") or []
         )
+
+    def rx_recording_cap(self) -> int:
+        """Return the byte limit RxTxApp stops this recording at, 0 if unbounded.
+
+        ``--rx_max_file_size`` is honoured by the st20p receiver alone
+        (``tests/tools/RxTxApp/src/rx_st20p_app.c``), so only st20p reports a cap.
+        """
+        if self.params.get("session_type") != "st20p":
+            return 0
+        return int(self.params.get("rx_max_file_size") or 0)
+
+    def _rx_recordings(self):
+        """Yield (session params, file) for every st20p and st30p RX recording.
+
+        RxTxApp records replica k of a replicated receiver to ``<url>_<k>``
+        (``tests/tools/RxTxApp/src/parse_json.c``); a single one keeps ``<url>``.
+        No other session type is byte-checked: st22p is lossy, and the rest
+        have no checker.
+        """
+        for params in self._session_params or [self.params]:
+            if params["session_type"] not in ("st20p", "st30p"):
+                continue
+            url, replicas = params.get("output_file"), params.get("replicas", 1)
+            if not url or replicas <= 1:
+                yield params, url
+            else:
+                yield from ((params, f"{url}_{k}") for k in range(replicas))
+
+    def rx_output_files(self) -> list[str]:
+        """Every file this run's receivers record to, for the test to clean up."""
+        return [url for _, url in self._rx_recordings() if url]
+
+    def rtcp_tx_stats(self) -> dict | None:
+        """RTCP TX counters of the last run, summed over every stats interval.
+
+        Only RxTxApp can enable RTCP: the FFmpeg and GStreamer plugins have no
+        RTCP option. MTL logs, for each TX session with RTCP enabled,
+        ``rtcp_tx_stat(<name>), rtp sent S nack recv N rtp retransmit succ R``
+        and, when not zero, ``rtcp_tx_stat(<name>), nack drop invalid D``.
+        Each interval resets its counters, so the run value is the sum.
+
+        Returns a dict with ``rtp_sent``, ``nack_recv``, ``retransmit_succ``
+        and ``nack_drop_invalid``, or None if no RTCP TX stats line was found.
+        """
+        if not self.last_output:
+            return None
+        main = re.compile(
+            r"rtcp_tx_stat\([^)]*\), rtp sent (\d+) nack recv (\d+) "
+            r"rtp retransmit succ (\d+)"
+        )
+        invalid = re.compile(r"rtcp_tx_stat\([^)]*\), nack drop invalid (\d+)")
+        stats = dict(rtp_sent=0, nack_recv=0, retransmit_succ=0, nack_drop_invalid=0)
+        seen = False
+        for line in self.last_output.split("\n"):
+            m = main.search(line)
+            if m:
+                seen = True
+                stats["rtp_sent"] += int(m.group(1))
+                stats["nack_recv"] += int(m.group(2))
+                stats["retransmit_succ"] += int(m.group(3))
+                continue
+            m = invalid.search(line)
+            if m:
+                stats["nack_drop_invalid"] += int(m.group(1))
+        return stats if seen else None
+
+    def integrity_intents(self, test_repo_path: str, host) -> list[IntegrityIntent]:
+        """One intent per RX recording, built with its own session's params in
+        place so it names that recording's files."""
+        primary, intents = self.params, []
+        try:
+            for params, url in self._rx_recordings():
+                self.params = {**params, "output_file": url}
+                intents.append(self.integrity_intent(test_repo_path, host))
+        finally:
+            self.params = primary
+        return intents
 
     def _resolve_capture_dst_ips(self) -> tuple[str, ...]:
         """Return the destination IPs for netsniff capture, possibly empty.

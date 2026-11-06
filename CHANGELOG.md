@@ -1,5 +1,31 @@
 # Changelog
 
+* ice: default to driver version 2.7.6, built as released with no MTL patches; versions before 2.7.6 keep their `patches/ice_drv` series
+* nicctl.sh: give each VF of an ice PF a 512-entry RSS LUT, so that it can have more than 16 queue pairs; `vf_rss_lut` does so for existing VFs
+* dev: warn when a port gets fewer queues than it asks for
+* st40: carry SMPTE ST 2110-41 Fast Metadata as an opt-in ST40 mode (`ST40_TX_FLAG_FAST_METADATA`/`ST40_RX_FLAG_FAST_METADATA`); add ABI fields `fmd_dit`/`fmd_k_bit` to `st40_tx_ops`; remove RxTxApp `"fastmetadata"` groups and `--*fmd*` options; share one 180-session scheduler limit between ANC and Fast Metadata (previously 180 each)
+* lcore: an lcore ID is the CPU ID again, so processes on different CPUs no longer claim the same lcore: build DPDK with `max_lcores` = build host CPUs (at least 128, at most 1024) or `DPDK_MAX_LCORES` (26.07.92_mtl_) and pass `--remap-lcore-ids` only on a host with more CPUs than `RTE_MAX_LCORE`, MtlManager hands out CPUs up to 1023; do not run MTL 26.09 or earlier on the same host
+
+## Changelog for 26.09
+
+* DPDK: add support for DPDK 26.03 and 26.07
+* ice: add support for driver version 2.5.4, 2.6.6, and 2.6.7; iavf: add support for 4.13.35
+* e830: add TX time launch support for TSN pacing
+* Add the Intel I226-V run guide (DPDK and AF_XDP flows) and an I225 CI leg
+* Add a global flag that lets ports be down at initialization time, also in GStreamer
+* st20p: add st20p_tx_notify_ext_frame_done for a safe ext_frame lifecycle
+* TX pipelines: add late-frame drop, and a late-frame check in st20p
+* st40p: add interlace auto-detection on RX; add st40p support to RxTxApp
+* st40: add RFC 8331 encode and decode helpers
+* Stats: add per-port RX stats with reorder and duplicate counters, and frame-level counters
+* RTCP: bound NACK parsing and retransmit work; count invalid RTCP packets per drop reason
+* FFmpeg: add 12-bit and UYVY pixel formats, PTP AVOptions, and p2-p7 NIC AVOptions
+* Add the CPU isolation guide and scripts, and the set_tai_offset tool
+* Add the MTL with MXL ecosystem bridge
+* Remove the deprecated user-space UDP stack and the deprecated gst_mtl_st40_rx plugin
+* Documentation: add the acceptance test, isolation, stats, fuzzing, and GStreamer guides to the site
+* General bugfixes and stability improvements
+
 ## Changelog for 26.01
 
 * DPDK: add support for DPDK 25.03, 25.07, and 25.11

@@ -43,11 +43,11 @@ UNIVERSAL_PARAMS = {
     "ancillary_url": "",  # Ancillary data URL
     "ancillary_fps": "p59",  # Ancillary data frame rate
     "tr_offset": "default",  # TR offset for legacy video sessions
-    # ST41 (Fast Metadata) parameters
-    "fastmetadata_data_item_type": 1234567,  # Data Item Type for ST41
-    "fastmetadata_k_bit": 0,  # K-bit value for ST41
-    "fastmetadata_fps": "p59",  # Frame rate for ST41
-    "type_mode": "frame",  # Type mode for ST41: "rtp" or "frame"
+    # ST2110-41 fast metadata, an opt-in of the ancillary session
+    "fast_metadata": False,  # Ancillary session carries ST2110-41 fast metadata
+    "fastmetadata_data_item_type": 1234567,  # 22-bit Data Item Type
+    "fastmetadata_k_bit": 0,  # Data Item K-bit
+    "type_mode": "frame",  # Session type mode: "rtp" or "frame"
     # Streaming parameters
     "payload_type": 112,  # RTP payload type
     "session_type": "st20p",  # Session type (st20p, st22p, st30p, video, audio, etc.)
@@ -89,7 +89,9 @@ UNIVERSAL_PARAMS = {
     # RxTxApp specific parameters
     "config_file": None,  # JSON config file path
     "lcores": None,  # DPDK lcore list (e.g., "28,29,30,31")
+    "cpu_isolation": None,  # None or "require" (exclusive cpuset partition, RxTxApp only)
     "dma_dev": None,  # DMA device list (e.g., "DMA1,DMA2,DMA3")
+    "dma_auto": False,  # Probe the DMA devices on the NUMA node of the ports
     "log_level": None,  # Log level (debug, info, notice, warning, error)
     "log_file": None,  # Log file path
     "arp_timeout_s": None,  # ARP timeout in seconds (default: 60)
@@ -100,7 +102,11 @@ UNIVERSAL_PARAMS = {
     "runtime_session": False,  # Start instance before creating sessions
     "rx_timing_parser": False,  # Enable timing check for video RX streams
     "auto_stop": False,  # Auto stop after input file ends
-    "rx_max_file_size": 0,  # Maximum RX file size in bytes (0 = no limit)
+    # Uncapped, one RX recording grows until it fills the ramdisk (4K p119 writes
+    # 2.5 GB/s). RxTxApp stops on a frame boundary here and keeps receiving, so the
+    # file stays a complete, verifiable prefix. configs/gen_config.py sizes the
+    # media ramdisk for this.
+    "rx_max_file_size": 8 * 1024**3,  # Maximum RX file size in bytes (0 = no limit)
     "pcapng_dump": None,  # Dump n packets to pcapng files
     "rx_video_file_frames": None,  # Dump received video frames to yuv file
     "promiscuous": False,  # Enable RX promiscuous mode

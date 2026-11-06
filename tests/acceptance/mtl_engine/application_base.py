@@ -8,10 +8,12 @@ import signal
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from .config.universal_params import UNIVERSAL_PARAMS
+from .const import KAHAWAI_CFG
 from .execute import kill_stale_processes, log_fail, run
+from .integrity import min_expected_frames
 from .integrity_session import NO_INTEGRITY, IntegrityIntent
 from .pcap_compliance import CAPTURE_SETTLE_TIME, NO_COMPLIANCE, CaptureIntent
 
@@ -24,13 +26,17 @@ logger = logging.getLogger(__name__)
 MTL_PTP_INTERNAL_TIMEOUT = 180
 
 
-# Encoder name -> MTL st22 plugin shared object, for require_encoder()
-# pre-flight checks shared across framework adapters.
-MTL_ENCODER_PLUGIN_MAP = {
-    "libsvt_jpegxs": "libst_plugin_st22_svt_jpeg_xs.so",
-    "libopenh264": "libst_plugin_st22_avcodec.so",
+# ST22P codec -> name prefix of the plugin device its sessions must get, as
+# st_plugin.c logs it ("get one session at <n> on dev <name>"). Any other
+# device, the sample plugin for one, means the codec under test did not run.
+_KAHAWAI_ENV_PREFIX = "env KAHAWAI_CFG_PATH="
+_ST22_CODEC_DEVICES = {
+    "JPEG-XS": "st22_svt_jpeg_xs_plugin",
+    "H264_CBR": "st22_plugin_avcodec",
 }
-
+_ST22_SESSION_DEV_RE = re.compile(
+    r"st22_get_(encoder|decoder)_session\(\d+\), get one session at \d+ on dev ([^\s,]+)"
+)
 _PACING_LOG_NAMES = {
     "auto": "auto",
     "rl": "ratelimit",
@@ -60,6 +66,11 @@ _PORT_TYPE_NAMES = {
     6: "native_af_xdp",
 }
 _PORT_TYPE_RE = re.compile(r"mt_dev_if_init\((\d+)\), port_id \d+ port_type (\d+)")
+# libmtl's RX video per-port stat line, printed only for a two-port (ST 2022-7) session.
+_RX_PORT_ARRIVALS_RE = re.compile(
+    r"RX_VIDEO_SESSION\(\d+,\d+\): per-port arrivals "
+    r"P=(\d+) pkts \([^)]*\), R=(\d+) pkts"
+)
 _VIRTIO_RE = re.compile(
     r"dev_if_init_virtio_user\((\d+)\), succ, kernel interface (\S+)"
 )
@@ -72,24 +83,23 @@ _RX_TIMING_RE = re.compile(
 )
 
 
-def mtl_plugin_check_cmd(plugin_so: str) -> str:
-    """Return a shell test that succeeds when *plugin_so* is loadable on the host.
-
-    Probes, in order: the dynamic-linker cache, the system plugin directories,
-    and the plugin path recorded in the active ``KAHAWAI_CFG_PATH`` registry --
-    which in CI points into the cached ``.local_install/plugins`` tree, so a
-    locally built (non system-installed) plugin is detected too.
-    """
-    return (
-        f"ldconfig -p 2>/dev/null | grep -q {plugin_so} "
-        f"|| test -f /usr/local/lib/x86_64-linux-gnu/{plugin_so} "
-        f"|| test -f /usr/local/lib64/{plugin_so} "
-        f"|| ( [ -d .local_install/plugins ] && find .local_install/plugins -name "
-        f"'{plugin_so}' 2>/dev/null | grep -q '{plugin_so}' ) "
-        '|| { cfg="${KAHAWAI_CFG_PATH:-kahawai.json}"; ok=1; '
-        f"for p in $(grep -F '{plugin_so}' \"$cfg\" 2>/dev/null | grep -oE '/[^\"]+\\.so'); do "
-        '[ -f "$p" ] && ok=0 && break; done; [ "$ok" = 0 ]; }'
-    )
+def st22_codec_devices_ok(output: str, codec: str, sides: Sequence[str]) -> bool:
+    """Return True when each *side* ("encoder", "decoder") has st22 sessions in
+    *output* and all of them run on the plugin of *codec*."""
+    prefix = _ST22_CODEC_DEVICES.get(codec)
+    if prefix is None:
+        return True
+    devices = {side: [] for side in sides}
+    for side, device in _ST22_SESSION_DEV_RE.findall(output or ""):
+        if side in devices:
+            devices[side].append(device)
+    for side, found in devices.items():
+        if not found or not all(device.startswith(prefix) for device in found):
+            logger.error(
+                f"ST22P {codec}: {side} sessions got {found or 'no device'}, expected {prefix}*"
+            )
+            return False
+    return True
 
 
 @dataclass
@@ -138,6 +148,12 @@ class Application(ABC):
         self.config_file_path = config_file_path
         self.params = UNIVERSAL_PARAMS.copy()
         self._user_provided_params = set()
+        # host.dma_device (set by nic_port_list's Nicctl.bind_dma()), stashed
+        # by app_factory -- see conftest.py for where that value comes from.
+        # When it is set, create_command() turns on dma_auto, unless the
+        # caller passed dma_dev= itself: the library then probes the DMA
+        # devices on the NUMA node of the ports.
+        self._default_dma_dev: str | None = None
         self.command: str | None = None
         self.config: dict | None = None
         self.last_output: str | None = None
@@ -169,10 +185,6 @@ class Application(ABC):
         """Return the executable name for this framework."""
         pass
 
-    def require_encoder(self, host, encoder: str, use_mtl_plugin: bool = False) -> None:
-        """Check that *encoder* is available. No-op by default; override in subclasses."""
-        pass
-
     def create_command(self, **kwargs):
         """Populate self.command (and optionally self.config) from user parameters.
 
@@ -200,6 +212,13 @@ class Application(ABC):
         # silently leak into the next test and cause spurious failures.
         self.params = UNIVERSAL_PARAMS.copy()
         self.set_params(**kwargs)
+        # A TX-only process does not probe: it would take the devices of the RX.
+        if (
+            "dma_dev" not in self._user_provided_params
+            and self._default_dma_dev
+            and self.params.get("direction") != "tx"
+        ):
+            self.params["dma_auto"] = True
         self.command, self.config = self._create_command_and_config()
         return self.command, self.config
 
@@ -266,6 +285,9 @@ class Application(ABC):
             if self.params.get("enable_ptp", False)
             else 0
         )
+        # Only an st30p session's params describe its audio: every other session
+        # still carries the UNIVERSAL_PARAMS audio defaults.
+        audio = self.params if self.params.get("session_type") == "st30p" else {}
         return CaptureIntent(
             dst_ips=self._resolve_capture_dst_ips(),
             capture_time=self.params.get("test_time", 30),
@@ -275,9 +297,12 @@ class Application(ABC):
             pacing=self.params.get("pacing"),
             width=self.params.get("width"),
             height=self.params.get("height"),
-            transport_format=self.params.get("transport_format"),
             framerate=self.params.get("framerate"),
             expected_video_streams=self._expected_video_streams(),
+            audio_format=audio.get("audio_format"),
+            audio_channels=audio.get("audio_channels"),
+            audio_sampling=audio.get("audio_sampling"),
+            audio_ptime=audio.get("audio_ptime"),
         )
 
     def _expected_video_streams(self) -> int:
@@ -291,6 +316,14 @@ class Application(ABC):
             )
         if self.params.get("session_type") == "st20p":
             return int(self.params.get("replicas", 1))
+        return 0
+
+    def rx_recording_cap(self) -> int:
+        """Bytes at which this app stops writing an RX recording, 0 if unbounded.
+
+        ``rx_max_file_size`` is a universal parameter, but only the adapters that
+        actually hand it to a receiver that enforces it override this.
+        """
         return 0
 
     def integrity_intent(self, test_repo_path: str, host) -> IntegrityIntent:
@@ -315,11 +348,22 @@ class Application(ABC):
             width=self.params.get("width"),
             height=self.params.get("height"),
             file_format=self.params.get("pixel_format"),
+            min_frames=min_expected_frames(
+                self.extract_framerate(self.params.get("framerate")),
+                self.params.get("test_time") or 30,
+            ),
+            max_file_size=self.rx_recording_cap(),
             audio_format=self.params.get("audio_format"),
             audio_channels=self.params.get("audio_channels"),
             audio_sampling=self.params.get("audio_sampling"),
             audio_ptime=self.params.get("audio_ptime"),
+            test_time=self.params.get("test_time") or 30,
         )
+
+    def integrity_intents(self, test_repo_path: str, host) -> list[IntegrityIntent]:
+        """One intent per RX recording to verify; adapters that run one stream
+        have exactly one."""
+        return [self.integrity_intent(test_repo_path, host)]
 
     def set_params(self, **kwargs):
         """Set parameters from user input and track which were provided."""
@@ -473,6 +517,25 @@ class Application(ABC):
             )
         return resolved
 
+    def assert_redundant_paths(self) -> None:
+        """Assert the ST 2022-7 receiver got the stream on both legs.
+
+        Either leg alone completes every frame, so a delivered stream does not
+        show that the redundant leg carried anything. Each leg carries a full
+        copy, so each must bring at least half as many packets as the other,
+        which leaves room for a transient loss on one leg.
+        """
+        arrivals = [
+            (int(p), int(r))
+            for p, r in _RX_PORT_ARRIVALS_RE.findall(self.last_output or "")
+        ]
+        assert arrivals, "no per-port arrival counts found in application output"
+        primary = sum(p for p, _ in arrivals)
+        redundant = sum(r for _, r in arrivals)
+        assert (
+            2 * min(primary, redundant) >= max(primary, redundant) > 0
+        ), f"ST 2022-7 receiver got {primary} packets on P and {redundant} on R"
+
     def assert_virtio_user(self, ports: list[int]):
         """Assert virtio-user initialized on each requested port."""
         initialized = [
@@ -506,6 +569,21 @@ class Application(ABC):
         assert marker in (self.last_output or ""), (
             "TSN failed without the unsupported-launch-time error; return code "
             f"was {self.last_return_code}"
+        )
+
+    def assert_rejected(self, marker: str) -> None:
+        """Assert the run failed, and failed with MTL's ``marker`` error.
+
+        For cases that feed MTL a setting it must refuse. The marker keeps an
+        unrelated failure, e.g. a port that never came up, from passing.
+        """
+        assert self.last_return_code not in (
+            0,
+            None,
+        ), f"MTL accepted a setting it should reject with '{marker}'"
+        assert marker in (self.last_output or ""), (
+            f"run failed without the '{marker}' error; return code was "
+            f"{self.last_return_code}"
         )
 
     def assert_rx_timing_compliance(
@@ -551,6 +629,19 @@ class Application(ABC):
             **kwargs: Additional arguments passed from execute_test
         """
         pass
+
+    def with_local_kahawai(self, command: str, build: str) -> str:
+        """Return *command* with ``KAHAWAI_CFG_PATH`` set to the plugin registry
+        of the local install in *build*.
+
+        RxTxApp and FFmpeg run with ``cwd=build``. Without ``KAHAWAI_CFG_PATH``
+        libmtl reads the tracked ``kahawai.json``, which disables JPEG XS and
+        enables the sample plugin in /usr/local. Returns *command* unchanged
+        when it already sets ``KAHAWAI_CFG_PATH``.
+        """
+        if command.startswith(_KAHAWAI_ENV_PREFIX):
+            return command
+        return f"{_KAHAWAI_ENV_PREFIX}{build}/{KAHAWAI_CFG} {command}"
 
     def execute_test(
         self,
@@ -636,7 +727,7 @@ class Application(ABC):
         # evaluate() below so both see the exact same snapshot of self.params
         # (self.params is mutable and must not be re-read mid-run).
         intent = self.capture_intent()
-        integrity_intent = self.integrity_intent(build, host)
+        integrity_intents = self.integrity_intents(build, host)
 
         if not is_dual:
             specs = [
@@ -661,7 +752,7 @@ class Application(ABC):
                 intent,
                 fail_on_error,
                 integrity=integrity,
-                integrity_intent=integrity_intent,
+                integrity_intents=integrity_intents,
             )
 
         # Dual-host: 2 bounded procs across 2 hosts.
@@ -752,7 +843,7 @@ class Application(ABC):
         fail_on_error: bool,
         *,
         integrity=NO_INTEGRITY,
-        integrity_intent: Optional[IntegrityIntent] = None,
+        integrity_intents: Sequence[IntegrityIntent] = (),
     ) -> bool:
         """Evaluate compliance, integrity and validate_results, run unconditionally.
 
@@ -773,11 +864,14 @@ class Application(ABC):
             compliance_ok = compliance.evaluate(intent, fail_on_error)
         except AssertionError as e:
             compliance_ok, compliance_exc = False, e
-        integrity_ok, integrity_exc = True, None
-        try:
-            integrity_ok = integrity.evaluate(integrity_intent, fail_on_error)
-        except AssertionError as e:
-            integrity_ok, integrity_exc = False, e
+        integrity_ok, integrity_excs = True, []
+        for integrity_intent in integrity_intents:
+            try:
+                if not integrity.evaluate(integrity_intent, fail_on_error):
+                    integrity_ok = False
+            except AssertionError as e:
+                integrity_ok = False
+                integrity_excs.append(e)
         validate_ok, validate_exc = True, None
         try:
             validate_ok = self._dispatch_validate(fail_on_error)
@@ -785,7 +879,7 @@ class Application(ABC):
             validate_ok, validate_exc = False, e
         failures = [
             exc
-            for exc in (compliance_exc, integrity_exc, validate_exc)
+            for exc in (compliance_exc, *integrity_excs, validate_exc)
             if exc is not None
         ]
         if fail_on_error and len(failures) == 1:

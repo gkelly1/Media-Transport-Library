@@ -15,11 +15,18 @@ asserts on production behaviour. The suite covers ST 2110-20 (video),
 ST 2110-30 (audio), ST 2110-40 (ancillary), and the ST 2110-40 pipeline. Tests
 run on any developer laptop in a fraction of a second.
 
-TX packet building/queueing, DMA, kernel-socket / AF_XDP backends, and
+TX packet building/queueing on a NIC, DMA copy engines, AF_XDP, and
 multi-process scenarios are out of scope — see
 [`tests/integration_tests/`](../integration_tests/) and
-[`tests/acceptance/`](../acceptance/) for those. TX epoch/pacing *math*
-(`session/st20_tx_harness.c`) is covered here.
+[`tests/acceptance/`](../acceptance/) for those. Covered here through seams:
+TX epoch/pacing *math*, frame completion, destination update and rate-limit
+lookup (`session/st20_tx_harness.c`), the ST 2110-40 packet builders, including
+the fast metadata mode (`session/st40_tx_harness.c`), the kernel-socket TX send path over
+loopback (`datapath/mt_dp_socket_harness.c`), RX queue selection without a
+flow (`datapath/mt_queue_harness.c`), the DMA map table
+(`dma/mt_map_harness.c`), the `MTL_FLAG_DMA_AUTO` probe over a fake PCI device
+tree (`dma/mt_dma_auto_harness.c`), port stats locking (`dev/mt_dev_harness.c`) and
+the MtlManager IPC send (`main/mt_instance_harness.c`).
 
 ## What makes this different
 
@@ -34,7 +41,16 @@ multi-process scenarios are out of scope — see
 
 If a test fails it's a real defect, unless a case with a wall-clock budget ran
 over it under load — an overrun that reproduces on an idle box is a defect. Only the
-eight `*Concurrency*` suites, `St20PipelineTxBlocking`, and `FfmpegMtlCommonTest.ConcurrentGetsCreateOneSharedHandle` carry a budget;
+eight `*Concurrency*` suites, `St20PipelineTxBlocking`, `WaitSites/St20PipelineRxBlocking`, the three
+`*WakePostedBeforeWaitIsNotLost` cases of `St22PipelineRxBlocking` /
+`St22PipelineTxEncodeBlocking`, the five `*FrameReadyWakesABlockedGet` cases of `St22PipelineRxBlocking` /
+`St22PipelineTxEncodeBlocking` / `St30PipelineRxBlocking` / `St40PipelineRxBlocking`, the two
+`*FirstFrameEndsANotReadyWait` cases of `St22PipelineRxBlocking` / `St22PipelineTxEncodeBlocking`, the eight
+`*DestroyEndsEveryBlockedGet` cases of `St22PipelineRxBlocking` / `St30PipelineRxBlocking` / `St40PipelineRxBlocking` /
+`St22PipelineTxBlocking` / `St22PipelineTxEncodeBlocking` / `St30PipelineTxBlocking` / `St40PipelineTxBlocking`, `PipelineTxWakeBlock`,
+`St20PipelineRxBlockingConvert`, `St22PipelineRxBlocking.WakeBlockEndsTheBlockedGetDespiteAFastPathGet`,
+`St30PipelineRxBlocking.WakeBlockForABlockedGetIsNotSpentByAnotherFastPathGet`, and
+`St40PipelineRxBlocking.FastPathGetDoesNotStealTheWakeOfABlockedGet` carry a budget;
 the exception reaches no other case. There are no flaky network-timing tests in this binary.
 
 ## Quick start
@@ -48,46 +64,27 @@ runs `tests/unit/UnitTest`.
 
 AddressSanitizer covers this tier only in part. `./build.sh debug unit` and
 `MTL_BUILD_ENABLE_ASAN=true ./build.sh unit` set `-Denable_asan=true`, which `lib/meson.build`
-adds to the `libmtl.so` compile arguments only. Both commands configure and build cleanly, but
-the resulting suite is not green: `St22PipelineConcurrency.RxSingleProducerMultiConsumerNoDeadlock`
-takes a SEGV and the sanitizer aborts the process. gtest prints no summary, and the binary exits
-nonzero part-way through the 513 cases — one observed run stopped after 482 of them had reported
-`OK`. `build.sh` runs under `set -e`, so the command dies there with a raw sanitizer backtrace.
-To compare the ASan and non-ASan runs, exclude the suite: `--gtest_filter=-St22PipelineConcurrency.*` runs
-the other 511 of the 513 cases and all pass. The crash needs `enable_asan` — the same case
-passes 3/3 without it. Before filing a defect against `lib/`, read the allocator paragraph
-below; no causal link between the two is established. Tracked as T-61.
+adds to the `libmtl.so` compile arguments only. Both commands build and run the whole suite.
 
-Coverage also splits: no `UnitTest` object gets `-fsanitize=address`, so the 17 production `.c`
-files this suite `#include`s into harness `.c` files are unchecked. The 237 shadowed symbols
-therefore resolve to uninstrumented code — 231 from the 16 `lib/` copies plus 6 harness stubs.
-`ecosystem/ffmpeg_plugin/mtl_common.c` is the one file of the 17 that contributes none of the
-231. Shadowing needs a `libmtl.so` symbol, and nothing `mtl_common.c` itself defines is in
-`libmtl.so`. `ffmpeg/mtl_common_harness.c` still shadows and defines 4 of the 6 stubs.
-`pipeline/st30p_tx_harness.c` defines the other 2.
+Coverage also splits: no `UnitTest` object gets `-fsanitize=address`, so the production `.c`
+files this suite `#include`s into harness `.c` files are unchecked. Any `libmtl.so` symbol that
+`UnitTest` also defines, whether from an included `.c` or a harness stub, resolves to that
+uninstrumented copy.
 
-`libmtl.so` *is* instrumented, so the 153 symbols `UnitTest` resolves from it are checked —
+`libmtl.so` *is* instrumented, so the symbols `UnitTest` resolves from it are checked —
 that covers any file no harness includes, such as `st2110/st_ancillary.c`. `build.sh` preloads
 the ASan runtime so the instrumented `libmtl.so` does not fault on an init-order interposition.
 
-Every symbol count above comes from `nm` over the built tree:
+To list the shadowed symbols and those resolved from `libmtl.so`, run `nm` over the built tree:
 
 ```sh
 cd build_unit
 nm --defined-only tests/unit/UnitTest.p/*.o | grep -oP '^\S+ [A-Z] \K\S+' | sort -u > own
 nm -D --defined-only lib/libmtl.so | grep -oP '^\S+ [A-Z] \K\S+' | sort -u > dso
 nm -u tests/unit/UnitTest.p/*.o | grep -oP '^ +U \K\S+' | sort -u > undef
-grep -rhoP '^#include "\K[^"]+\.c(?=")' ../tests/unit | grep -v '^\.\.' |
-  sed 's|/|_|g; s|^|lib/libmtl.so.p/src_|; s|$|.o|' | sort -u | xargs nm --defined-only |
-  grep -oP '^\S+ [A-Z] \K\S+' | sort -u > copies
-comm -12 own dso > shadowed
-wc -l < shadowed                             # 237 shadowed
-comm -12 shadowed copies | wc -l             # 231 from the 16 lib/ copies
-comm -23 shadowed copies | wc -l             # 6 harness stubs; drop wc -l to name them
-comm -12 undef dso | comm -23 - own | wc -l  # 153 resolved from the DSO
+comm -12 own dso                     # shadowed: uninstrumented
+comm -12 undef dso | comm -23 - own  # resolved from libmtl.so: instrumented
 ```
-
-Dropping the `comm -23 - own` step gives 195, counting symbols a harness copy already defines.
 
 The same option also forks an allocator API. `-DMTL_HAS_ASAN` rides in `mtl_c_args` next to the
 sanitizer flag, and `lib/src/mt_mem.h` keys on it to switch `mt_rte_zmalloc_socket()` and its
@@ -125,6 +122,9 @@ Filter to a single suite or test:
 
 # list everything without running
 ./build_unit/tests/unit/UnitTest --gtest_list_tests
+
+# run the known-bug tests (UT_KNOWN_BUG in common/ut_known_bug.h) to see them still fail
+UT_RUN_KNOWN_BUGS=1 ./build_unit/tests/unit/UnitTest
 ```
 
 ### ST20 continuation bounds regression

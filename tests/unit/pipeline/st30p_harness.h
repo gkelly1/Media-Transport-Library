@@ -9,9 +9,7 @@
  *   - stat_frames_dropped bumps in rx_st30p_frame_ready() when no free
  *     framebuffer is available (back-pressure; transport-side buffer is
  *     released by the pipeline returning -EBUSY).
- *
- * ST30p has no stat_frames_corrupted — audio frames are never delivered
- * with status CORRUPTED at this layer.
+ *   - stat_frames_corrupted bumps in st30p_rx_get_frame().
  */
 
 #ifndef _ST30P_PIPELINE_HARNESS_H_
@@ -29,10 +27,22 @@ extern "C" {
 
 typedef struct ut30p_ctx ut30p_ctx;
 
+/** 1 ms of 48 kHz stereo PCM16, i.e. one packet payload. */
+#define UT30P_FRAMEBUFF_SIZE (192)
+
 int ut30p_init(void);
 
 ut30p_ctx* ut30p_ctx_create(int framebuff_cnt);
 void ut30p_ctx_destroy(ut30p_ctx* ctx);
+
+/**
+ * Turn on ST30P_RX_FLAG_BLOCK_GET behaviour: init the block cond/mutex as
+ * st30p_rx_create() does and set the blocking get_frame timeout.
+ */
+void ut30p_ctx_enable_blocking(ut30p_ctx* ctx, uint64_t timeout_ns);
+
+/** The first two steps of st30p_rx_free(): begin_destroy, then wake_on_destroy. */
+void ut30p_begin_destroy(ut30p_ctx* ctx);
 
 /** Inject one synthetic audio frame as if the transport just completed it.
  *  status is ST_FRAME_STATUS_COMPLETE or _CORRUPTED.
@@ -57,6 +67,25 @@ uint32_t ut30p_stat_busy(const ut30p_ctx* ctx);
 
 int ut30p_get_session_stats(ut30p_ctx* ctx, struct st30_rx_user_stats* stats);
 int ut30p_reset_session_stats(ut30p_ctx* ctx);
+
+/** The pipeline handle, for calling the public st*p API directly. */
+st30p_rx_handle ut30p_handle(ut30p_ctx* ctx);
+
+/** Force ctx->lc_destroying, as a *_free() in progress sets it. */
+void ut30p_force_destroying(ut30p_ctx* ctx);
+
+/** Wraps st30p_rx_get_queue_meta(), which no public header declares. */
+int ut30p_get_queue_meta(ut30p_ctx* ctx, struct st_queue_meta* meta);
+
+/** Hold block_wake_mutex from the test so a woken waiter cannot read the token
+ *  until unlock; post_wake_locked runs the st30p_rx_wake_block() body (token +
+ *  broadcast) while the caller holds it. */
+void ut30p_lock_block_mutex(ut30p_ctx* ctx);
+void ut30p_post_wake_locked(ut30p_ctx* ctx);
+void ut30p_unlock_block_mutex(ut30p_ctx* ctx);
+
+/** Set framebuffer idx directly to READY, with no notify. */
+void ut30p_set_ready_no_notify(ut30p_ctx* ctx, int idx);
 
 #ifdef __cplusplus
 }

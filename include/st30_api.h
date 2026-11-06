@@ -44,12 +44,27 @@ typedef struct st_rx_audio_session_handle_impl* st30_rx_handle;
  * lib will wait until timestamp is reached for each frame.
  * Only ST10_TIMESTAMP_FMT_TAI is honored; ST10_TIMESTAMP_FMT_MEDIA_CLK is not
  * supported for pacing and falls back to the default epoch-based pacing.
+ * Distinct from ST30_TX_FLAG_USER_TIMESTAMP, which honors both formats for
+ * the reported rtp timestamp regardless of whether this flag is also set.
  */
 #define ST30_TX_FLAG_USER_PACING (MTL_BIT32(3))
 /**
  * Flag bit in flags of struct st30_tx_ops.
- * If enabled, lib will assign the rtp timestamp to the value in
- * st30_tx_frame_meta(ST10_TIMESTAMP_FMT_MEDIA_CLK is used)
+ * If enabled, lib assigns the rtp timestamp from st30_tx_frame_meta.timestamp,
+ * interpreted per st30_tx_frame_meta.tfmt. ST10_TIMESTAMP_FMT_TAI is used
+ * directly. ST10_TIMESTAMP_FMT_MEDIA_CLK is unwrapped against the TAI instant
+ * the session's pacing has scheduled for the current packet, to the nearest
+ * matching TAI instant, so the supplied ticks must represent a time within
+ * about half a 32-bit tick cycle (~12.4 hours at 48kHz) of that instant, or
+ * the unwrap resolves to the wrong cycle. Only the frame's first packet
+ * honors the app-supplied timestamp; later packets of a multi-packet frame
+ * advance from it by one packet time each when ST30_TX_FLAG_USER_PACING is
+ * also set. Without ST30_TX_FLAG_USER_PACING, only the first packet's
+ * timestamp is honored -- later packets fall back to the default
+ * natural-cadence instant instead of continuing to advance from it.
+ * rtp_timestamp_delta_us is then applied in the TAI/ns domain the same way for
+ * either format, so its effect is an identical microsecond-scale shift
+ * regardless of tfmt.
  */
 #define ST30_TX_FLAG_USER_TIMESTAMP (MTL_BIT32(4))
 /**
@@ -60,6 +75,7 @@ typedef struct st_rx_audio_session_handle_impl* st30_rx_handle;
 /**
  * Flag bit in flags of struct st30_tx_ops.
  * If enable the rtcp.
+ * Currently ignored, RTCP is implemented only for st20/st22 video sessions.
  */
 #define ST30_TX_FLAG_ENABLE_RTCP (MTL_BIT32(6))
 /**
@@ -79,6 +95,7 @@ typedef struct st_rx_audio_session_handle_impl* st30_rx_handle;
 /**
  * Flag bit in flags of struct st30_rx_ops.
  * If enable the rtcp.
+ * Currently ignored, RTCP is implemented only for st20/st22 video sessions.
  */
 #define ST30_RX_FLAG_ENABLE_RTCP (MTL_BIT32(1))
 /** Force the numa of the created session, both CPU and memory */
@@ -88,6 +105,14 @@ typedef struct st_rx_audio_session_handle_impl* st30_rx_handle;
  * If enabled, simulate random packet loss, test usage only.
  */
 #define ST30_RX_FLAG_SIMULATE_PKT_LOSS (MTL_BIT32(3))
+/**
+ * Flag bit in flags of struct st30_rx_ops.
+ * Only for ST30_TYPE_FRAME_LEVEL.
+ * If set, lib will pass the incomplete frame to app also by notify_frame_ready.
+ * User can check st30_rx_frame_meta data for the frame integrity. The packets
+ * that never arrived read as zero(silence).
+ */
+#define ST30_RX_FLAG_RECEIVE_INCOMPLETE_FRAME (MTL_BIT32(4))
 /**
  * Flag bit in flags of struct st30_rx_ops.
  * Enable the timing analyze in the stat dump
@@ -133,7 +158,7 @@ enum st30_ptime {
   ST30_PTIME_250US,   /**< packet time of 250us */
   ST30_PTIME_333US,   /**< packet time of 333us */
   ST30_PTIME_4MS,     /**< packet time of 4ms */
-  ST31_PTIME_80US,    /**< packet time of 80us */
+  ST31_PTIME_80US,    /**< packet time of 83.33us: 4 samples at 48kHz, 8 at 96kHz */
   ST31_PTIME_1_09MS,  /**< packet time of 1.09ms, only for 44.1kHz sample */
   ST31_PTIME_0_14MS,  /**< packet time of 0.14ms, only for 44.1kHz sample */
   ST31_PTIME_0_09MS,  /**< packet time of 0.09ms, only for 44.1kHz sample */
@@ -423,6 +448,9 @@ struct st30_tx_ops {
   /**
    * Optional. The rtp timestamp delta(us) to the start time of frame.
    * Zero means the rtp timestamp at the start of the frame.
+   * Applied in the TAI/ns domain, so with ST30_TX_FLAG_USER_TIMESTAMP the
+   * shift is the same microsecond amount whether the app's timestamp was
+   * ST10_TIMESTAMP_FMT_TAI or ST10_TIMESTAMP_FMT_MEDIA_CLK.
    */
   int32_t rtp_timestamp_delta_us;
 
@@ -436,7 +464,7 @@ struct st30_tx_ops {
   int (*notify_rtp_done)(void* priv);
   /** Optional for ST30_TX_PACING_WAY_RL, the required accuracy for warmup check point */
   uint32_t rl_accuracy_ns;
-  /** Optional for ST30_TX_PACING_WAY_RL, the offset time(us) for warmup check point */
+  /** Optional for ST30_TX_PACING_WAY_RL, the offset time(ns) for warmup check point */
   int32_t rl_offset_ns;
   /**  Use this socket if ST30_TX_FLAG_FORCE_NUMA is on, default use the NIC numa */
   int socket_id;
@@ -573,16 +601,16 @@ struct st30_rx_user_stats {
   uint64_t stat_pkts_dropped;
   uint64_t stat_pkts_len_mismatch_dropped;
   uint64_t stat_slot_get_frame_fail;
+  uint64_t stat_frames_incomplete;
 };
 
 /**
  * Retrieve the general statistics(I/O) for one tx st2110-30(audio) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the tx st2110-30(audio) session.
- * @param port
- *   The port index.
  * @param stats
  *   A pointer to stats structure.
  * @return
@@ -594,11 +622,10 @@ int st30_tx_get_session_stats(st30_tx_handle handle, struct st30_tx_user_stats* 
 /**
  * Reset the general statistics(I/O) for one tx st2110-30(audio) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the tx st2110-30(audio) session.
- * @param port
- *   The port index.
  * @return
  *   - >=0 succ.
  *   - <0: Error code.
@@ -608,11 +635,10 @@ int st30_tx_reset_session_stats(st30_tx_handle handle);
 /**
  * Retrieve the general statistics(I/O) for one rx st2110-30(audio) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the rx st2110-30(audio) session.
- * @param port
- *   The port index.
  * @param stats
  *   A pointer to stats structure.
  * @return
@@ -624,11 +650,10 @@ int st30_rx_get_session_stats(st30_rx_handle handle, struct st30_rx_user_stats* 
 /**
  * Reset the general statistics(I/O) for one rx st2110-30(audio) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the rx st2110-30(audio) session.
- * @param port
- *   The port index.
  * @return
  *   - >=0 succ.
  *   - <0: Error code.

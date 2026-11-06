@@ -7,6 +7,15 @@
 
 #include "mt_main.h"
 
+/* The copy of the library. Every copy of lib/ goes through this function, so the
+ * next line is the one place that selects the backend. It is the libc memcpy:
+ * glibc reads the CPU at load time and selects an AVX-512, an AVX2 or an ERMS
+ * path, while rte_memcpy takes the path that DPDK was built for, and rte_memcpy
+ * measured slower on the RX frame write path. The two areas must not overlap. */
+static inline void* mt_memcpy(void* dest, const void* src, size_t n) {
+  return memcpy(dest, src, n);
+}
+
 static inline bool mt_rtp_len_valid(uint16_t len) {
   if (len <= 0 || len > MTL_PKT_MAX_RTP_BYTES)
     return false;
@@ -47,9 +56,10 @@ static inline void mt_u32_to_ip(uint32_t group, uint8_t ip[MTL_IP_ADDR_LEN]) {
   ip[3] = group >> 24;
 }
 
-bool mt_bitmap_test_and_set(uint8_t* bitmap, int idx);
-bool mt_bitmap_test(uint8_t* bitmap, int idx);
-bool mt_bitmap_test_and_unset(uint8_t* bitmap, int idx);
+/* size is the length of bitmap in bytes, idx the bit to address */
+bool mt_bitmap_test_and_set(uint8_t* bitmap, size_t size, int idx);
+bool mt_bitmap_test(uint8_t* bitmap, size_t size, int idx);
+bool mt_bitmap_test_and_unset(uint8_t* bitmap, size_t size, int idx);
 
 /* only for mbuf ring with RING_F_SP_ENQ | RING_F_SC_DEQ */
 int mt_ring_dequeue_clean(struct rte_ring* ring);
@@ -57,9 +67,13 @@ int mt_ring_dequeue_clean(struct rte_ring* ring);
 void mt_mbuf_sanity_check(struct rte_mbuf** mbufs, uint16_t nb, char* tag);
 
 int mt_pacing_train_pad_result_add(struct mtl_main_impl* impl, enum mtl_port port,
-                                   uint64_t input_bps, float pad_interval);
+                                   uint64_t input_bps, uint64_t queue_bps,
+                                   const struct mt_pacing_pad_mix* mix,
+                                   float pad_interval);
 int mt_pacing_train_pad_result_search(struct mtl_main_impl* impl, enum mtl_port port,
-                                      uint64_t input_bps, float* pad_interval);
+                                      uint64_t input_bps, uint64_t queue_bps,
+                                      const struct mt_pacing_pad_mix* mix,
+                                      float* pad_interval);
 
 int mt_pacing_train_bps_result_add(struct mtl_main_impl* impl, enum mtl_port port,
                                    uint64_t input_bps, uint64_t profiled_bps);
@@ -74,6 +88,14 @@ int mt_build_port_map(struct mtl_main_impl* impl, char** ports, enum mtl_port* m
 static inline enum mtl_port mt_port_logic2phy(enum mtl_port* maps,
                                               enum mtl_session_port logic) {
   return maps[logic];
+}
+
+/* whether any of the num_port session ports is a deep TX port */
+static inline bool mt_tx_deep_session(struct mtl_main_impl* impl, enum mtl_port* maps,
+                                      int num_port) {
+  for (int i = 0; i < num_port; i++)
+    if (mt_if_tx_deep(impl, mt_port_logic2phy(maps, i))) return true;
+  return false;
 }
 
 void st_video_rtp_dump(enum mtl_port port, int idx, char* tag,

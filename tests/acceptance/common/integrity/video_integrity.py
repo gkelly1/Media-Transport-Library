@@ -7,7 +7,7 @@ import hashlib
 import logging
 import multiprocessing
 import re
-import subprocess
+import subprocess  # nosec B404 # runs ffmpeg via an argv list, no shell
 import sys
 import time
 from pathlib import Path
@@ -47,7 +47,7 @@ def calculate_chunk_hashes(file_url: str, chunk_size: int) -> list:
                     f"{len(chunk)} < {chunk_size} bytes"
                 )
                 break
-            chunk_sums.append(hashlib.md5(chunk).hexdigest())
+            chunk_sums.append(hashlib.md5(chunk, usedforsecurity=False).hexdigest())
             chunk_index += 1
     return chunk_sums
 
@@ -67,7 +67,7 @@ def calculate_yuv_frame_size(width: int, height: int, file_format: str) -> int:
         case "YUV444PLANAR12LE" | "GBRPLANAR12LE" | "yuv444p12le" | "gbrp12le":
             # 3 planes (Y/U/V or G/B/R), 12-bit samples padded to 2 bytes each
             pixel_size = 6
-        case "yuv420p":
+        case "YUV420CUSTOM8" | "yuv420p":
             # I420: full Y plane + quarter-size U + quarter-size V
             pixel_size = 1.5
         case "UYVY" | "uyvy422":
@@ -76,6 +76,11 @@ def calculate_yuv_frame_size(width: int, height: int, file_format: str) -> int:
         case "Y210" | "y210le":
             # Packed 4:2:2 10-bit, 2 samples per pixel × 2 bytes per sample
             pixel_size = 4
+        case "v210":
+            # Packed 4:2:2 10-bit, 16 bytes per 6 pixels, each row padded to a
+            # multiple of 48 pixels (Apple TN2162) as GStreamer and FFmpeg do
+            aligned_width = (width + 47) // 48 * 48
+            return aligned_width * 8 // 3 * height
         case "RGB8":
             pixel_size = 3
         case _:
@@ -124,7 +129,7 @@ class VideoIntegritor:
                 first_chunk = handle.read(self.frame_size)
             if len(first_chunk) != self.frame_size:
                 raise ValueError(f"Output file {out_file} is smaller than one frame")
-            first_sum = hashlib.md5(first_chunk).hexdigest()
+            first_sum = hashlib.md5(first_chunk, usedforsecurity=False).hexdigest()
             if first_sum not in self.src_chunk_sums:
                 self.logger.warning(
                     f"First frame hash not found in {self.src_url}; "
@@ -356,11 +361,13 @@ class VideoFileIntegritor(VideoIntegritor):
         file_format: str = "yuv422p10le",
         out_path: str = "/mnt/ramdisk",
         delete_file: bool = True,
+        min_frames: int = 1,
     ):
         super().__init__(
             logger, src_url, out_name, resolution, file_format, out_path, delete_file
         )
         self.logger = logging.getLogger(__name__)
+        self.min_frames = min_frames
 
     def get_out_file(self):
         try:
@@ -374,6 +381,14 @@ class VideoFileIntegritor(VideoIntegritor):
 
     def check_st20p_integrity(self) -> bool:
         output_file = self.get_out_file()
+        frames = output_file.stat().st_size // self.frame_size
+        if frames < self.min_frames:
+            self.logger.error(
+                f"{output_file} holds {frames} whole frames, {self.min_frames} "
+                f"expected -- the recording was cut short, so the frames it does "
+                f"hold cannot vouch for the ones it does not."
+            )
+            return False
         self.shift_src_chunk_by_first_frame_no(output_file)
         result = self.check_integrity_file(output_file)
         return result
@@ -479,6 +494,12 @@ It performs frame-by-frame integrity checking using MD5 checksums."""
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_common_arguments(file_parser)
+    file_parser.add_argument(
+        "--min_frames",
+        type=int,
+        default=1,
+        help="Whole frames the recording must hold to count as complete (default: 1)",
+    )
 
     # Parse the arguments
     args = parser.parse_args()
@@ -505,6 +526,7 @@ It performs frame-by-frame integrity checking using MD5 checksums."""
             args.fmt,
             args.output_path,
             args.delete_file,
+            args.min_frames,
         )
     else:
         parser.print_help()

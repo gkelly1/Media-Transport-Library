@@ -80,8 +80,8 @@ static enum st_rx_tp_compliant rv_tp_compliant(struct st_rx_video_tp* tp,
     rv_tp_compliant_set_cause(&slot->meta, "fpt exceed tr_offset");
     return ST_RX_TP_COMPLIANT_FAILED;
   }
-  /* rtp ts delta check */
-  if (slot->meta.rtp_ts_delta < tp->pass.rtp_ts_delta_min) {
+  /* rtp ts delta check, 0 when the port has no previous frame */
+  if (slot->meta.rtp_ts_delta && slot->meta.rtp_ts_delta < tp->pass.rtp_ts_delta_min) {
     rv_tp_compliant_set_cause(&slot->meta, "rtp_ts_delta exceed min");
     return ST_RX_TP_COMPLIANT_FAILED;
   }
@@ -138,7 +138,8 @@ static enum st_rx_tp_compliant rv_tp_compliant(struct st_rx_video_tp* tp,
 }
 
 void rv_tp_slot_parse_result(struct st_rx_video_session_impl* s,
-                             enum mtl_session_port s_port, struct st_rv_tp_slot* slot) {
+                             enum mtl_session_port s_port, struct st_rv_tp_slot* slot,
+                             bool second_field) {
   struct st_rx_video_tp* tp = s->tp;
   float cinst_avg = rv_tp_calculate_avg(slot->meta.pkts_cnt, slot->cinst_sum);
   float vrx_avg = rv_tp_calculate_avg(slot->meta.pkts_cnt, slot->vrx_sum);
@@ -152,10 +153,16 @@ void rv_tp_slot_parse_result(struct st_rx_video_session_impl* s,
   dbg("%s(%d), VRX AVG %.2f MIN %d MAX %d \n", __func__, s->idx, vrx_avg,
       slot->meta.vrx_min, slot->meta.vrx_max);
   dbg("%s(%d), Inter-packet time(ns) AVG %.2f MIN %d MAX %d!\n", __func__, s->idx,
-      ipt_avg, slot->meta.ipt_max, slot->meta.ipt_min);
+      ipt_avg, slot->meta.ipt_min, slot->meta.ipt_max);
 
   /* parse tp compliant for current frame */
   enum st_rx_tp_compliant compliant = rv_tp_compliant(tp, slot);
+  /* ST 2110-21 6.2 frame grid: even epoch slot = first field. doc/design.md 6.6 */
+  if (s->ops.interlaced && compliant != ST_RX_TP_COMPLIANT_FAILED &&
+      ((slot->cur_epochs & 0x1) != second_field)) {
+    rv_tp_compliant_set_cause(&slot->meta, "field parity off frame grid");
+    compliant = ST_RX_TP_COMPLIANT_FAILED;
+  }
   slot->meta.compliant = compliant;
 
   if (!s->enable_timing_parser_stat) return;
@@ -168,13 +175,13 @@ void rv_tp_slot_parse_result(struct st_rx_video_session_impl* s,
 
   stat_slot->vrx_sum += slot->vrx_sum;
   stat_slot->meta.vrx_min = RTE_MIN(stat_slot->meta.vrx_min, slot->meta.vrx_min);
-  stat_slot->meta.vrx_max = RTE_MAX(stat_slot->meta.vrx_min, slot->meta.vrx_max);
+  stat_slot->meta.vrx_max = RTE_MAX(stat_slot->meta.vrx_max, slot->meta.vrx_max);
   stat_slot->cinst_sum += slot->cinst_sum;
   stat_slot->meta.cinst_min = RTE_MIN(stat_slot->meta.cinst_min, slot->meta.cinst_min);
   stat_slot->meta.cinst_max = RTE_MAX(stat_slot->meta.cinst_max, slot->meta.cinst_max);
   stat_slot->ipt_sum += slot->ipt_sum;
   stat_slot->meta.ipt_min = RTE_MIN(stat_slot->meta.ipt_min, slot->meta.ipt_min);
-  stat_slot->meta.ipt_max = RTE_MAX(stat_slot->meta.ipt_min, slot->meta.ipt_max);
+  stat_slot->meta.ipt_max = RTE_MAX(stat_slot->meta.ipt_max, slot->meta.ipt_max);
   stat_slot->meta.pkts_cnt += slot->meta.pkts_cnt;
 
   stat->stat_fpt_min = RTE_MIN(stat->stat_fpt_min, slot->meta.fpt);

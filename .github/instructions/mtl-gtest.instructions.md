@@ -34,8 +34,7 @@ applyTo: "tests/integration_tests/**,.github/scripts/gtest.sh"
 | `St20_rx*` | ST2110-20 raw RX | ~2 min |
 | `St22*` | ST2110-22 compressed video | ~1 min |
 | `St30*` | ST2110-30 audio | ~1 min |
-| `St40*` | ST2110-40 ancillary | ~30s |
-| `St41*` | ST2110-41 fast metadata | ~30s |
+| `St40*` | ST2110-40 ancillary, incl. the ST2110-41 fast metadata opt-in | ~30s |
 | `Misc*` | Miscellaneous / utility | ~30s |
 | `Sch*` | Scheduler tests | ~1 min |
 | `Dma*` | DMA engine tests (need --dma_dev) | ~1 min |
@@ -69,9 +68,9 @@ sudo ./build/tests/KahawaiTest \
 - Shards `St20_rx*` and `St20_tx*` into 2 parts for parallelism
 - Randomizes station IPs
 - Retries failed tests (MAX_RETRIES=2, RETRY_DELAY=20s)
-- TEST_CASE_TIMEOUT=1800s per test case
+- TEST_CASE_TIMEOUT=1800s per test case; NOCTX_CASE_TIMEOUT=4200s for the noctx case (all NoCtx tests in one run)
 
-Key env vars: `TEST_PORT_1..4`, `TEST_DMA_PORT_P`, `TEST_DMA_PORT_R`, `NIGHTLY=1`
+Key env vars: `TEST_PORT_1..4`, `NIGHTLY=1`
 
 ## Noctx Tests
 
@@ -81,7 +80,8 @@ run in its own KahawaiTest process**. Never pass a filter that matches multiple
 NoCtxTest cases to a single `KahawaiTest` invocation — the second case will
 fail with `dev_eal_init, eal not support re-init`.
 
-Requires 4 VF ports. Run serially with a cooldown (10s) between processes:
+`run.sh` requires 4 ports (PFs or VFs bound to vfio-pci) and runs the cases
+serially, 20 s apart (10 s for `run_pf.sh` and the MCP tools):
 
 ```bash
 TEST_PORT_1=... TEST_PORT_2=... TEST_PORT_3=... TEST_PORT_4=... \
@@ -94,6 +94,13 @@ same enumeration + one-process-per-test loop; it accepts filters that resolve
 to many cases (e.g. `*nonsplit*`, `NoCtxTest.st40i_*`) and reports per-test
 pass/fail.
 
+Strict pacing cases SKIP unless TX and RX are on different physical ports with a
+reachable PHC and NIC RX timestamps (FAIL with `NOCTX_REQUIRE_STRICT=1`, as in
+CI); `st20p_redundant_1080p59_s8_equal_vrx_margin` needs 4 ports, TX on one PF and RX
+on the other on both legs (fewer than 4 ports: FAIL); `st30p_user_pacing` FAILs outside an isolated
+cpuset partition (`run.sh` creates one via `tests/tools/isolate/isolate.sh`). Per-case oracles and
+tolerances: [tests/integration_tests/noctx/README.md](../../tests/integration_tests/noctx/README.md).
+
 ## Interpreting Results
 
 ### Normal warnings (not failures)
@@ -101,19 +108,19 @@ pass/fail.
 - `Error: DEV: Status: rx_hw_dropped_packets N` — NIC hardware drops, normal at high rates
 
 ### Actual failures
-- **SEGFAULT in `iavf_tm_node_add`** → Stock kernel ICE driver. Fix: `ice_driver_rebuild` + re-create VFs.
+- **SEGFAULT in `iavf_tm_node_add`** → In-tree ICE driver. Fix: `ice_driver_rebuild` + re-create VFs.
 - **`librte_*.so not found`** → Run `sudo ldconfig` or rebuild DPDK.
 - **Permission denied on CMakeCache.txt** → `mtl_clean_rebuild`.
 - **Test timeout** → Check if MtlManager is running. Check NUMA locality.
 
 ### Pacing modes
-- **`auto`** (default): Uses hardware rate limiter (RL) on E810/E830 with patched ICE. Best accuracy.
-- **`tsc`**: Software TSC-based pacing. Works without patched ICE. Use to isolate pacing bugs.
+- **`auto`** (default): Uses hardware rate limiter (RL) on E810/E830 with the out-of-tree ICE. Best accuracy.
+- **`tsc`**: Software TSC-based pacing. Works with the in-tree ICE. Use to isolate pacing bugs.
 - If tests pass with `tsc` but fail with `auto` → ICE driver or NIC firmware issue.
 
 ## 4-Port / Redundancy Tests
 
-Tests named `*redundant*` need 4 ports. The test skips gracefully if only 2 ports are provided:
+KahawaiTest cases named `*redundant*` need 4 ports and skip gracefully if only 2 ports are provided (NoCtx redundant cases FAIL instead):
 ```text
 TestBody, need 4 ports for redundant test, skipping
 ```

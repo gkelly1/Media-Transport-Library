@@ -57,6 +57,7 @@ struct st20p_tx_ctx {
   bool derive; /* input_fmt == transport_fmt */
 
   size_t src_size;
+  uint64_t frame_period_ns; /* derived from ops.fps at create, non-zero */
 
   bool second_field;
 
@@ -65,7 +66,7 @@ struct st20p_tx_ctx {
   pthread_cond_t block_wake_cond;
   pthread_mutex_t block_wake_mutex;
   uint64_t block_timeout_ns;
-  bool block_wake_pending;
+  uint32_t wake_block_cnt;
 
   rte_atomic32_t stat_convert_fail;
   rte_atomic32_t stat_busy;

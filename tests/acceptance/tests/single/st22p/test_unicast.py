@@ -12,6 +12,10 @@ from mtl_engine.media_files import yuv_files_422p10le
     [
         "rxtxapp",
         "ffmpeg",
+        pytest.param(
+            "gstreamer",
+            marks=pytest.mark.skip(reason="GStreamer does not support st22p pipeline"),
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -28,6 +32,7 @@ def test_st22p_unicast(
     setup_interfaces: InterfaceSetup,
     test_time,
     test_config,
+    output_files,
     media_file,
 ):
     """Test st22p unicast transmission mode."""
@@ -40,7 +45,6 @@ def test_st22p_unicast(
     test_time = max(test_time, 90)
 
     app = app_factory(application)
-    app.require_encoder(host, "libsvt_jpegxs", use_mtl_plugin=True)
     app.create_command(
         session_type="st22p",
         test_mode="unicast",
@@ -52,6 +56,7 @@ def test_st22p_unicast(
         quality="speed",
         pixel_format=media_file_info["file_format"],
         input_file=media_file_path,
+        output_file=output_files.register(f"{media_file_path}.out"),
         codec_threads=2,
         test_time=test_time,
     )

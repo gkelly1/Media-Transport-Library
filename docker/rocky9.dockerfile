@@ -4,8 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Rocky Linux 9 with eBPF/XDP support
-ARG IMAGE_CACHE_REGISTRY=docker.io
-FROM "${IMAGE_CACHE_REGISTRY}/library/rockylinux:9" AS builder
+FROM rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f AS builder
 
 LABEL maintainer="andrzej.wilczynski@intel.com,dawid.wesierski@intel.com,marek.kasiewicz@intel.com"
 
@@ -32,7 +31,7 @@ RUN dnf install -y epel-release && \
         ca-certificates sudo curl unzip wget patch \
         python3-devel python3-pip python3-pyelftools \
         git gcc gcc-c++ make pkg-config ninja-build \
-        numactl-devel json-c-devel libpcap-devel gtest-devel \
+        numactl-devel json-c-devel libpcap-devel gtest-devel gmock-devel \
         SDL2-devel SDL2_ttf-devel openssl-devel systemtap-sdt-devel \
         m4 clang llvm zlib-devel elfutils-libelf-devel libcap-ng-devel libcap-ng-utils \
         glibc-devel.i686 && \
@@ -49,17 +48,18 @@ RUN ./build_ebpf_xdp.sh
 WORKDIR "${MTL_REPO}/script"
 RUN ./build_dpdk.sh -f
 
-# Build MTL
+# Run the unit suite, then build MTL. The gcc of Rocky Linux enables no
+# compiler hardening by default, so check what MTL builds, see doc/build.md.
 WORKDIR "${MTL_REPO}"
-RUN ./build.sh && \
+RUN ./build.sh unit && \
+    ./build.sh && \
     ninja -C build install && \
     DESTDIR=/install ninja -C build install && \
-    setcap 'cap_net_raw+ep' tests/tools/RxTxApp/build/RxTxApp
+    setcap 'cap_net_raw+ep' tests/tools/RxTxApp/build/RxTxApp && \
+    .github/scripts/ci/scan/check-hardening.sh build build_unit tests/tools/RxTxApp/build /install
 
 # Rocky Linux 9, runtime/final stage
-ARG MTL_REPO
-ARG IMAGE_CACHE_REGISTRY
-FROM "${IMAGE_CACHE_REGISTRY}/library/rockylinux:9" AS final
+FROM rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f AS final
 
 LABEL org.opencontainers.image.authors="andrzej.wilczynski@intel.com,dawid.wesierski@intel.com,marek.kasiewicz@intel.com"
 LABEL org.opencontainers.image.url="https://github.com/OpenVisualCloud/Media-Transport-Library"
@@ -78,21 +78,33 @@ SHELL ["/bin/bash", "-ex", "-o", "pipefail", "-c"]
 # Install runtime dependencies
 WORKDIR /home/imtl/
 RUN dnf install -y epel-release && \
+    dnf update -y && \
     dnf install -y --allowerasing \
         ca-certificates sudo curl unzip \
-        numactl-libs json-c libpcap SDL2 SDL2_ttf openssl-libs zlib elfutils-libelf libcap-ng libatomic && \
+        numactl-libs json-c libpcap SDL2 SDL2_ttf openssl-libs zlib elfutils-libelf libcap-ng libatomic pciutils && \
     dnf clean all && \
     echo "Add user: imtl(20001) with group vfio(2110)" && \
     groupadd -g 2110 vfio && \
     useradd -m -G vfio,root -u 20001 imtl
 
-# Copy libraries and binaries
+# Copy libraries and binaries.
+#
+# Meson uses the libdir of the distribution, so DPDK and MTL install to
+# /usr/local/lib64 on Rocky Linux and to /usr/local/lib/x86_64-linux-gnu on
+# the Debian images. A COPY of the Debian path fails the Rocky build.
+COPY --from=builder /usr/local/lib64/* /usr/local/lib64/
+COPY --from=builder /usr/local/bin/* /usr/local/bin/
 COPY --chown=imtl --from=builder /install /
 COPY --chown=imtl --from=builder "${MTL_REPO}/build" "/home/imtl"
 COPY --chown=imtl --from=builder "${MTL_REPO}/tests/tools/RxTxApp/build/RxTxApp" "/home/imtl/RxTxApp"
 COPY --chown=imtl --from=builder "${MTL_REPO}/tests/tools/RxTxApp/script" "/home/imtl/scripts"
+COPY --chown=imtl --from=builder "${MTL_REPO}/script" "/home/imtl/script"
 
-RUN ldconfig
+# ldconfig on Rocky Linux reads /lib and /lib64 only, so it does not see
+# /usr/local/lib64. Name the directory before ldconfig runs, or RxTxApp and the
+# manager do not find libmtl.so and librte_*.so.
+RUN echo "/usr/local/lib64" >/etc/ld.so.conf.d/mtl-usr-local-lib64.conf && \
+    ldconfig
 SHELL ["/bin/bash", "-c"]
 
 USER imtl

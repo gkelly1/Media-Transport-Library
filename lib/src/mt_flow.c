@@ -128,10 +128,10 @@ static struct rte_flow* rte_rx_flow_create(struct mt_interface* inf, uint16_t q,
   if (has_ip_flow) {
     memset(&ipv4_mask.hdr.dst_addr, 0xFF, MTL_IP_ADDR_LEN);
     if (mt_is_multicast_ip(flow->dip_addr)) {
-      rte_memcpy(&ipv4_spec.hdr.dst_addr, flow->dip_addr, MTL_IP_ADDR_LEN);
+      mt_memcpy(&ipv4_spec.hdr.dst_addr, flow->dip_addr, MTL_IP_ADDR_LEN);
     } else {
-      rte_memcpy(&ipv4_spec.hdr.src_addr, flow->dip_addr, MTL_IP_ADDR_LEN);
-      rte_memcpy(&ipv4_spec.hdr.dst_addr, flow->sip_addr, MTL_IP_ADDR_LEN);
+      mt_memcpy(&ipv4_spec.hdr.src_addr, flow->dip_addr, MTL_IP_ADDR_LEN);
+      mt_memcpy(&ipv4_spec.hdr.dst_addr, flow->sip_addr, MTL_IP_ADDR_LEN);
       memset(&ipv4_mask.hdr.src_addr, 0xFF, MTL_IP_ADDR_LEN);
     }
   }
@@ -175,9 +175,18 @@ static struct rte_flow* rte_rx_flow_create(struct mt_interface* inf, uint16_t q,
     return NULL;
   }
 
-  mt_pthread_mutex_lock(&inf->vf_cmd_mutex);
-  r_flow = rte_flow_create(port_id, &attr, pattern, action, &error);
-  mt_pthread_mutex_unlock(&inf->vf_cmd_mutex);
+  const int max_retry = 5;
+
+  for (int retry = 0; retry < max_retry;) {
+    mt_pthread_mutex_lock(&inf->vf_cmd_mutex);
+    r_flow = rte_flow_create(port_id, &attr, pattern, action, &error);
+    mt_pthread_mutex_unlock(&inf->vf_cmd_mutex);
+    if (r_flow) break;
+    err("%s(%d), rte_flow_create fail for queue %d, retry %d, %s\n", __func__, port, q,
+        retry, mt_string_safe(error.message));
+    retry++;
+    if (retry < max_retry) mt_sleep_ms(10); /* WA: to wait pf finish the vf request */
+  }
 
   /* WA specific for e810 for PF interfaces */
   if (!has_ip_flow && !r_flow) {
@@ -264,26 +273,22 @@ static int rx_flow_free(struct mt_interface* inf, struct mt_rx_flow_rsp* rsp) {
   enum mtl_port port = inf->port;
   struct rte_flow_error error;
   int ret;
-  int max_retry = 5;
-  int retry = 0;
+  const int max_retry = 5;
 
-retry:
   if (rsp->flow_id > 0) {
     mt_socket_remove_flow(inf->parent, port, rsp->flow_id, rsp->dst_port);
     rsp->flow_id = -1;
   }
   if (rsp->flow) {
-    mt_pthread_mutex_lock(&inf->vf_cmd_mutex);
-    ret = rte_flow_destroy(inf->port_id, rsp->flow, &error);
-    mt_pthread_mutex_unlock(&inf->vf_cmd_mutex);
-    if (ret < 0) {
+    for (int retry = 0; retry < max_retry;) {
+      mt_pthread_mutex_lock(&inf->vf_cmd_mutex);
+      ret = rte_flow_destroy(inf->port_id, rsp->flow, &error);
+      mt_pthread_mutex_unlock(&inf->vf_cmd_mutex);
+      if (ret >= 0) break;
       err("%s(%d), flow destroy fail, queue %d, retry %d\n", __func__, port,
           rsp->queue_id, retry);
       retry++;
-      if (retry < max_retry) {
-        mt_sleep_ms(10); /* WA: to wait pf finish the vf request */
-        goto retry;
-      }
+      if (retry < max_retry) mt_sleep_ms(10); /* WA: to wait pf finish the vf request */
     }
     rsp->flow = NULL;
   }

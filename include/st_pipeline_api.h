@@ -385,18 +385,28 @@ enum st22p_tx_flag {
    * User control the frame pacing by pass a timestamp in st_frame,
    * lib will wait until timestamp is reached for each frame.
    * Only ST10_TIMESTAMP_FMT_TAI is honored; ST10_TIMESTAMP_FMT_MEDIA_CLK is not
-   * supported for pacing and falls back to the default epoch-based pacing.
+   * supported for pacing and falls back to the default epoch-based pacing. Distinct
+   * from ST22P_TX_FLAG_USER_TIMESTAMP, which honors both formats for the reported
+   * rtp timestamp.
    */
   ST22P_TX_FLAG_USER_PACING = (MTL_BIT32(3)),
   /**
-   * Drop frames when the mtl reports late frames (transport can't keep up).
-   * When late frame is detected, next frame from pipeline is ommited.
-   * Untill we resume normal frame sending.
+   * Drop a ready frame instead of sending it when it is already late. Only effective
+   * together with ST22P_TX_FLAG_USER_PACING and a frame timestamp in
+   * ST10_TIMESTAMP_FMT_TAI, otherwise the flag is ignored. Checked when the transport
+   * asks for its next frame: a frame counts as late once PTP time reaches its timestamp
+   * plus one frame period. A dropped frame gets notify_frame_done with
+   * ST_FRAME_STATUS_DROPPED, then notify_frame_late with epoch_skipped 0.
    */
   ST22P_TX_FLAG_DROP_WHEN_LATE = (MTL_BIT32(12)),
   /**
-   * If enabled, lib will assign the rtp timestamp to the value in
-   * tx_frame_meta(ST10_TIMESTAMP_FMT_MEDIA_CLK is used)
+   * If enabled, lib assigns the rtp timestamp from st_frame.timestamp, interpreted
+   * per st_frame.tfmt. ST10_TIMESTAMP_FMT_TAI is used directly.
+   * ST10_TIMESTAMP_FMT_MEDIA_CLK is unwrapped against the TAI instant the session's
+   * pacing has scheduled for the current frame, to the nearest matching TAI instant,
+   * so the supplied ticks must represent a time within about half a 32-bit tick
+   * cycle (~6.6 hours at 90kHz) of that instant, or the unwrap resolves to the wrong
+   * cycle.
    */
   ST22P_TX_FLAG_USER_TIMESTAMP = (MTL_BIT32(4)),
   /**
@@ -446,19 +456,30 @@ enum st20p_tx_flag {
    * lib will wait until timestamp is reached for each frame. The time of sending is
    * aligned with virtual receiver read schedule.
    * Only ST10_TIMESTAMP_FMT_TAI is honored; ST10_TIMESTAMP_FMT_MEDIA_CLK is not
-   * supported for pacing and falls back to the default epoch-based pacing.
+   * supported for pacing and falls back to the default epoch-based pacing. Distinct
+   * from ST20P_TX_FLAG_USER_TIMESTAMP, which honors both formats for the reported
+   * rtp timestamp.
    */
   ST20P_TX_FLAG_USER_PACING = (MTL_BIT32(3)),
   /**
-   * Drop frames when the mtl reports late frames (transport can't keep up).
-   * When late frame is detected, next frame from pipeline is ommited.
-   * Untill we resume normal frame sending.
+   * Drop a ready frame instead of sending it when it is already late. Only effective
+   * together with ST20P_TX_FLAG_USER_PACING and a frame timestamp in
+   * ST10_TIMESTAMP_FMT_TAI, otherwise the flag is ignored. Checked when the transport
+   * asks for its next frame: a frame counts as late once PTP time reaches its timestamp
+   * plus one frame period. A dropped frame gets notify_frame_done with
+   * ST_FRAME_STATUS_DROPPED, then notify_frame_late with epoch_skipped 0.
    */
   ST20P_TX_FLAG_DROP_WHEN_LATE = (MTL_BIT32(12)),
   /**
-   * If enabled, lib will assign the rtp timestamp to the value of timestamp in
-   * st_frame.timestamp (if needed the value will be converted to
-   * ST10_TIMESTAMP_FMT_MEDIA_CLK)
+   * If enabled, lib assigns the rtp timestamp from st_frame.timestamp, interpreted
+   * per st_frame.tfmt. ST10_TIMESTAMP_FMT_TAI is used directly.
+   * ST10_TIMESTAMP_FMT_MEDIA_CLK is unwrapped against the TAI instant the session's
+   * pacing has scheduled for the current frame, to the nearest matching TAI instant,
+   * so the supplied ticks must represent a time within about half a 32-bit tick
+   * cycle (~6.6 hours at 90kHz) of that instant, or the unwrap resolves to the wrong
+   * cycle. rtp_timestamp_delta_us is then applied in the TAI/ns domain the same way
+   * for either format, so its effect is an identical microsecond-scale shift
+   * regardless of tfmt.
    */
   ST20P_TX_FLAG_USER_TIMESTAMP = (MTL_BIT32(4)),
   /**
@@ -534,6 +555,10 @@ enum st22p_rx_flag {
   ST22P_RX_FLAG_EXT_FRAME = (MTL_BIT32(4)),
   /** Force the numa of the created session, both CPU and memory */
   ST22P_RX_FLAG_FORCE_NUMA = MTL_BIT32(5),
+  /**
+   * Disable ST22 boxes
+   */
+  ST22P_RX_FLAG_DISABLE_BOXES = MTL_BIT32(6),
 
   /** Enable the st22p_rx_get_frame block behavior to wait until a frame becomes
      available or timeout(default: 1s, use st22p_rx_set_block_timeout to customize) */
@@ -947,6 +972,9 @@ struct st20p_tx_ops {
   /**
    * Optional. The rtp timestamp delta(us) to the start time of frame.
    * Zero means the rtp timestamp at the start of the frame.
+   * Applied in the TAI/ns domain, so with ST20P_TX_FLAG_USER_TIMESTAMP the shift is
+   * the same microsecond amount whether the app's timestamp was
+   * ST10_TIMESTAMP_FMT_TAI or ST10_TIMESTAMP_FMT_MEDIA_CLK.
    */
   int32_t rtp_timestamp_delta_us;
   /**
@@ -1901,11 +1929,10 @@ int st20p_tx_get_pacing_params(st20p_tx_handle handle, double* tr_offset_ns,
 /**
  * Retrieve the general statistics(I/O) for one tx st2110-20(pipeline) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the tx st2110-20(pipeline) session.
- * @param port
- *   The port index.
  * @param stats
  *   A pointer to stats structure.
  * @return
@@ -1917,11 +1944,10 @@ int st20p_tx_get_session_stats(st20p_tx_handle handle, struct st20_tx_user_stats
 /**
  * Reset the general statistics(I/O) for one tx st2110-20(pipeline) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the tx st2110-20(pipeline) session.
- * @param port
- *   The port index.
  * @return
  *   - >=0 succ.
  *   - <0: Error code.
@@ -2099,11 +2125,10 @@ int st20p_rx_get_sch_idx(st20p_rx_handle handle);
 /**
  * Retrieve the general statistics(I/O) for one rx st2110-20(pipeline) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the rx st2110-20(pipeline) session.
- * @param port
- *   The port index.
  * @param stats
  *   A pointer to stats structure.
  * @return
@@ -2115,11 +2140,10 @@ int st20p_rx_get_session_stats(st20p_rx_handle handle, struct st20_rx_user_stats
 /**
  * Reset the general statistics(I/O) for one rx st2110-20(pipeline) session.
  *
- * @note Thread-safe. Briefly acquires the per-session spinlock.
+ * @note Thread-safe. Briefly acquires the per-session spinlock. Do not call it from
+ * this session's callbacks: they may run with that spinlock held, so it deadlocks.
  * @param handle
  *   The handle to the rx st2110-20(pipeline) session.
- * @param port
- *   The port index.
  * @return
  *   - >=0 succ.
  *   - <0: Error code.
@@ -2284,7 +2308,7 @@ uint8_t st_frame_fmt_planes(enum st_frame_fmt fmt);
 
 /** helper to know if it's a codestream fmt */
 static inline bool st_frame_fmt_is_codestream(enum st_frame_fmt fmt) {
-  if (fmt >= ST_FRAME_FMT_CODESTREAM_START && fmt <= ST_FRAME_FMT_CODESTREAM_END)
+  if (fmt >= ST_FRAME_FMT_CODESTREAM_START && fmt < ST_FRAME_FMT_CODESTREAM_END)
     return true;
   else
     return false;

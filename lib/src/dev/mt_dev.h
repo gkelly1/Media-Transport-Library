@@ -10,6 +10,9 @@
 /* default desc nb for tx and rx */
 #define MT_DEV_RX_DESC (4096 / 2)
 #define MT_DEV_TX_DESC (4096 / 8)
+/* tx of a shaped port that frees sent mbufs each burst: 1024 chained video pkts, ~3.8 ms
+ * at 1080p59.94, ride out a lost scheduler slice */
+#define MT_DEV_TX_DESC_DEEP (4096 / 2)
 
 /* Port link-up detection loop parameters.
  *
@@ -37,7 +40,27 @@
 /** Sleep between polls in relaxed/allow_down_init mode (ms). */
 #define MT_DEV_LINK_POLL_INTERVAL_MS_RELAXED 10
 
-#define MT_EAL_MAX_ARGS (32)
+/**
+ * Upper bound on the EAL argv dev_eal_init() builds: 19 fixed entries plus two per port
+ * and two per DMA device. Bump the 19 when adding a fixed option.
+ */
+#define MT_EAL_MAX_ARGS (19 + 2 * MTL_PORT_MAX + 2 * MTL_DMA_DEV_MAX)
+
+/**
+ * Width of the "-l" corelist dev_eal_init() builds: main_lcore plus every lcore named
+ * individually, at most 10 digits and a separator each, plus the NUL.
+ */
+#define MT_EAL_LCORES_MAX_LEN ((RTE_MAX_LCORE + 1) * 11 + 1)
+
+/**
+ * Width of one EAL port argument: a PCI devarg or a vdev string, with its options.
+ * Widest writer is the eth_af_packet vdev at 109 bytes: 54 literal + 6 conversion digits
+ * + 48-byte iface + NUL. qpairs takes 5 digits because queue_pair_cnt + 1 on a uint16_t
+ * reaches 65536; the iface cap is MTL_PORT_MAX_LEN - 1 less the 15-char
+ * "dpdk_af_packet:" prefix. net_af_xdp is 102 and a PCI devarg 89, so 128 leaves 19
+ * bytes of margin.
+ */
+#define MT_EAL_PORT_ARG_MAX_LEN (2 * MTL_PORT_MAX_LEN)
 
 #define MT_TX_MEMPOOL_PREFIX "T_"
 #define MT_RX_MEMPOOL_PREFIX "R_"
@@ -65,8 +88,10 @@ static inline uint16_t mt_dev_tx_queue_id(struct mt_tx_queue* queue) {
 int mt_dev_tx_queue_fatal_error(struct mtl_main_impl* impl, struct mt_tx_queue* queue);
 int mt_dev_set_tx_bps(struct mtl_main_impl* impl, struct mt_tx_queue* queue,
                       uint64_t bytes_per_sec);
+/* frees what the queue holds; on a reclaim port bounded, -EBUSY if it did not drain in
+ * time, and with no mbuf for its mark the per-pad loop if lazy_fallback, else -ENOMEM */
 int mt_dpdk_flush_tx_queue(struct mtl_main_impl* impl, struct mt_tx_queue* queue,
-                           struct rte_mbuf* pad);
+                           struct rte_mbuf* pad, bool lazy_fallback);
 int mt_dev_tx_done_cleanup(struct mtl_main_impl* impl, struct mt_tx_queue* queue);
 static inline uint16_t mt_dpdk_tx_burst(struct mt_tx_queue* queue,
                                         struct rte_mbuf** tx_pkts, uint16_t nb_pkts) {

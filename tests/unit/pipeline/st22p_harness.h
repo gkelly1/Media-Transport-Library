@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright(c) 2026 Intel Corporation
  *
- * C header for ST22p (compressed video) RX pipeline-layer concurrency unit
- * tests.
+ * C header for ST22p (compressed video) RX pipeline-layer concurrency and
+ * blocking-wait unit tests.
  *
- * Exposes the two role-halves of the lock-free RX framebuffer ring so a
+ * Exposes the role-halves of the lock-free RX framebuffer ring so a
  * gtest can drive them from independent threads:
- *   - producer (transport): inject_frame (FREE->DECODED via frame_ready)
- *   - consumer (app):        get_frame (DECODED->IN_USER) / put_frame (->FREE)
+ *   - producer (transport):    inject_frame (FREE->DECODED via frame_ready)
+ *   - consumer (app):          get_frame (DECODED->IN_USER) / put_frame (->FREE)
+ *   - decoder plugin:          decode_get_frame (READY->IN_DECODING)
+ * plus the blocking-wait setup the app and plugin sides each have.
  *
  * The ctx is hand-initialised in the derive (no-decoder) path so frame_ready
  * advances a frame straight to DECODED, the state get_frame consumes. This
@@ -35,6 +37,52 @@ int ut22p_init(void);
 ut22p_ctx* ut22p_ctx_create(int framebuff_cnt);
 void ut22p_ctx_destroy(ut22p_ctx* ctx);
 
+/**
+ * Turn on ST22P_RX_FLAG_BLOCK_GET behaviour: init the block cond/mutex and set
+ * the blocking get_frame timeout. Call before any blocking get_frame. Mirrors
+ * the block setup st22p_rx_create() performs.
+ */
+void ut22p_ctx_enable_blocking(ut22p_ctx* ctx, uint64_t timeout_ns);
+
+/** Wake a blocking get_frame sleeper (wraps st22p_rx_wake_block). */
+void ut22p_wake_block(ut22p_ctx* ctx);
+
+/** Hold block_wake_mutex from the test so a woken waiter cannot read the token
+ *  until unlock; post_wake_locked runs the st22p_rx_wake_block() body (token +
+ *  broadcast) while the caller holds it. */
+void ut22p_lock_block_mutex(ut22p_ctx* ctx);
+void ut22p_post_wake_locked(ut22p_ctx* ctx);
+void ut22p_unlock_block_mutex(ut22p_ctx* ctx);
+
+/** Set framebuffer idx directly to DECODED, with no notify. */
+void ut22p_set_frame_decoded(ut22p_ctx* ctx, int idx);
+
+/**
+ * Turn on ST22_DECODER_RESP_FLAG_BLOCK_GET behaviour for the decoder-plugin
+ * side: init the decode block cond/mutex and set its wait timeout. Call before
+ * any ut22p_decode_get_frame().
+ */
+void ut22p_ctx_enable_decode_blocking(ut22p_ctx* ctx, uint64_t timeout_ns);
+
+/** Switch to the decoder path with a no-op decoder device: frame_ready leaves
+ *  the frame READY for ut22p_decode_get_frame(). */
+void ut22p_ctx_set_decoder(ut22p_ctx* ctx);
+
+/** Set ctx->ready, as st22p_rx_create() does once the session is built. */
+void ut22p_set_ready(ut22p_ctx* ctx, bool ready);
+
+/** Wake a blocking decode_get_frame sleeper, via the callback the decoder
+ * device is registered with (wraps rx_st22p_decode_wake_block). */
+void ut22p_decode_wake_block(ut22p_ctx* ctx);
+
+/** The first two steps of st22p_rx_free(): begin_destroy, then wake_on_destroy.
+ *  That wakes both block conds, so enable both blockings first. */
+void ut22p_begin_destroy(ut22p_ctx* ctx);
+
+/* decoder-plugin side: claim READY->IN_DECODING. Returns 0 when a frame was
+ * handed back, -EBUSY when none was. */
+int ut22p_decode_get_frame(ut22p_ctx* ctx);
+
 int ut22p_framebuff_cnt(const ut22p_ctx* ctx);
 
 /* producer (transport) side: drive one frame to DECODED. Returns 0 on success,
@@ -54,6 +102,19 @@ int ut22p_frame_stat(const ut22p_ctx* ctx, int i);
 /* Times the harness stub ran; 0 means put_frame stopped reaching the transport
  * put path. */
 uint64_t ut22p_stub_call_count(void);
+
+/** The pipeline handle, for calling the public st*p API directly. */
+st22p_rx_handle ut22p_handle(ut22p_ctx* ctx);
+
+/** Force ctx->lc_destroying, as a *_free() in progress sets it. */
+void ut22p_force_destroying(ut22p_ctx* ctx);
+
+/**
+ * Call st22p_rx_create() on a bare instance with one port, named in
+ * ops->port.port[0] by this call. For create paths that fail before any
+ * transport or decoder is needed.
+ */
+st22p_rx_handle ut22p_rx_create(struct st22p_rx_ops* ops);
 
 #ifdef __cplusplus
 }

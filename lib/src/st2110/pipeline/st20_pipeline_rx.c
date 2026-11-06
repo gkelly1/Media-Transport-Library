@@ -30,7 +30,7 @@ static void rx_st20p_block_wake(struct st20p_rx_ctx* ctx) {
   /* notify block */
   mt_pthread_mutex_lock(&ctx->block_wake_mutex);
   ctx->block_wake_pending = true;
-  mt_pthread_cond_signal(&ctx->block_wake_cond);
+  mt_pthread_cond_broadcast(&ctx->block_wake_cond);
   mt_pthread_mutex_unlock(&ctx->block_wake_mutex);
 }
 
@@ -40,8 +40,10 @@ static void rx_st20p_notify_frame_available(struct st20p_rx_ctx* ctx) {
   }
 
   if (ctx->block_get) {
-    /* notify block */
-    rx_st20p_block_wake(ctx);
+    /* signal only, the waiter claims the frame itself */
+    mt_pthread_mutex_lock(&ctx->block_wake_mutex);
+    mt_pthread_cond_signal(&ctx->block_wake_cond);
+    mt_pthread_mutex_unlock(&ctx->block_wake_mutex);
   }
 }
 
@@ -252,7 +254,7 @@ static int rx_st20p_frame_ready(void* priv, void* frame,
 
   for (enum mtl_session_port s_port = 0; s_port < ctx->ops.port.num_port; s_port++) {
     if (!meta->tp[s_port]) continue;
-    mtl_memcpy(&framebuff->tp[s_port], meta->tp[s_port], sizeof(framebuff->tp[s_port]));
+    mt_memcpy(&framebuff->tp[s_port], meta->tp[s_port], sizeof(framebuff->tp[s_port]));
     framebuff->src.tp[s_port] = framebuff->dst.tp[s_port] = &framebuff->tp[s_port];
   }
 
@@ -260,7 +262,7 @@ static int rx_st20p_frame_ready(void* priv, void* frame,
   framebuff->user_meta_data_size = 0;
   if (meta->user_meta) {
     if (meta->user_meta_size <= framebuff->user_meta_buffer_size) {
-      rte_memcpy(framebuff->user_meta, meta->user_meta, meta->user_meta_size);
+      mt_memcpy(framebuff->user_meta, meta->user_meta, meta->user_meta_size);
       framebuff->user_meta_data_size = meta->user_meta_size;
     } else {
       err("%s(%d), wrong user_meta_size\n", __func__, ctx->idx);
@@ -857,19 +859,29 @@ struct st_frame* st20p_rx_get_frame(st20p_rx_handle handle) {
     framebuff = rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
                                          ST20P_RX_FRAME_READY, ST20P_RX_FRAME_IN_USER);
     if (!framebuff && ctx->block_get) { /* wait here */
+      struct timespec deadline;
+      clock_gettime(MT_THREAD_TIMEDWAIT_CLOCK_ID, &deadline);
+      timespec_add_ns(&deadline, ctx->block_timeout_ns);
       mt_pthread_mutex_lock(&ctx->block_wake_mutex);
       while (!ctx->block_wake_pending &&
              !atomic_load_explicit(&ctx->lc_destroying, memory_order_acquire)) {
-        int _ret = mt_pthread_cond_timedwait_ns(
-            &ctx->block_wake_cond, &ctx->block_wake_mutex, ctx->block_timeout_ns);
+        framebuff =
+            rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
+                                     ST20P_RX_FRAME_READY, ST20P_RX_FRAME_IN_USER);
+        if (framebuff) break;
+        int _ret = mt_pthread_cond_timedwait(&ctx->block_wake_cond,
+                                             &ctx->block_wake_mutex, &deadline);
         if (_ret) break;
       }
       ctx->block_wake_pending = false;
       mt_pthread_mutex_unlock(&ctx->block_wake_mutex);
-      if (atomic_load_explicit(&ctx->lc_destroying, memory_order_acquire)) goto out;
-      /* get again */
-      framebuff = rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
-                                           ST20P_RX_FRAME_READY, ST20P_RX_FRAME_IN_USER);
+      if (!framebuff) {
+        if (atomic_load_explicit(&ctx->lc_destroying, memory_order_acquire)) goto out;
+        /* get again */
+        framebuff =
+            rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
+                                     ST20P_RX_FRAME_READY, ST20P_RX_FRAME_IN_USER);
+      }
     }
     /* not any ready frame */
     if (!framebuff) {
@@ -881,20 +893,29 @@ struct st_frame* st20p_rx_get_frame(st20p_rx_handle handle) {
         rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
                                  ST20P_RX_FRAME_CONVERTED, ST20P_RX_FRAME_IN_USER);
     if (!framebuff && ctx->block_get) { /* wait here */
+      struct timespec deadline;
+      clock_gettime(MT_THREAD_TIMEDWAIT_CLOCK_ID, &deadline);
+      timespec_add_ns(&deadline, ctx->block_timeout_ns);
       mt_pthread_mutex_lock(&ctx->block_wake_mutex);
       while (!ctx->block_wake_pending &&
              !atomic_load_explicit(&ctx->lc_destroying, memory_order_acquire)) {
-        int _ret = mt_pthread_cond_timedwait_ns(
-            &ctx->block_wake_cond, &ctx->block_wake_mutex, ctx->block_timeout_ns);
+        framebuff =
+            rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
+                                     ST20P_RX_FRAME_CONVERTED, ST20P_RX_FRAME_IN_USER);
+        if (framebuff) break;
+        int _ret = mt_pthread_cond_timedwait(&ctx->block_wake_cond,
+                                             &ctx->block_wake_mutex, &deadline);
         if (_ret) break;
       }
       ctx->block_wake_pending = false;
       mt_pthread_mutex_unlock(&ctx->block_wake_mutex);
-      if (atomic_load_explicit(&ctx->lc_destroying, memory_order_acquire)) goto out;
-      /* get again */
-      framebuff =
-          rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
-                                   ST20P_RX_FRAME_CONVERTED, ST20P_RX_FRAME_IN_USER);
+      if (!framebuff) {
+        if (atomic_load_explicit(&ctx->lc_destroying, memory_order_acquire)) goto out;
+        /* get again */
+        framebuff =
+            rx_st20p_claim_available(ctx, ctx->framebuff_consumer_idx,
+                                     ST20P_RX_FRAME_CONVERTED, ST20P_RX_FRAME_IN_USER);
+      }
     }
     /* not any converted frame */
     if (!framebuff) {
@@ -1169,9 +1190,9 @@ void* st20p_rx_get_fb_addr(st20p_rx_handle handle, uint16_t idx) {
     goto out;
   }
   if (ctx->derive)
-    ret_addr = ctx->framebuffs[idx].src.addr;
+    ret_addr = ctx->framebuffs[idx].src.addr[0];
   else
-    ret_addr = ctx->framebuffs[idx].dst.addr;
+    ret_addr = ctx->framebuffs[idx].dst.addr[0];
 out:
   MT_HANDLE_RELEASE(ctx);
   return ret_addr;
@@ -1204,7 +1225,7 @@ int st20p_rx_get_queue_meta(st20p_rx_handle handle, struct st_queue_meta* meta) 
   struct st20p_rx_ctx* ctx = handle;
   int ret;
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   ret = st20_rx_get_queue_meta(ctx->transport, meta);
   MT_HANDLE_RELEASE(ctx);
@@ -1215,7 +1236,7 @@ int st20p_rx_get_sch_idx(st20p_rx_handle handle) {
   struct st20p_rx_ctx* ctx = handle;
   int ret;
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   ret = st20_rx_get_sch_idx(ctx->transport);
   MT_HANDLE_RELEASE(ctx);
@@ -1231,7 +1252,7 @@ int st20p_rx_get_session_stats(st20p_rx_handle handle, struct st20_rx_user_stats
     return -EINVAL;
   }
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   ret = st20_rx_get_session_stats(ctx->transport, stats);
   if (ret < 0) goto out;
@@ -1257,7 +1278,7 @@ int st20p_rx_reset_session_stats(st20p_rx_handle handle) {
     return -EINVAL;
   }
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   atomic_store_explicit(&ctx->stat_frames_received, 0, memory_order_relaxed);
   atomic_store_explicit(&ctx->stat_frames_dropped, 0, memory_order_relaxed);
@@ -1271,7 +1292,7 @@ int st20p_rx_update_source(st20p_rx_handle handle, struct st_rx_source_info* src
   struct st20p_rx_ctx* ctx = handle;
   int ret;
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   ret = st20_rx_update_source(ctx->transport, src);
   MT_HANDLE_RELEASE(ctx);
@@ -1283,7 +1304,7 @@ int st20p_rx_timing_parser_critical(st20p_rx_handle handle,
   struct st20p_rx_ctx* ctx = handle;
   int ret;
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   ret = st20_rx_timing_parser_critical(ctx->transport, pass);
   MT_HANDLE_RELEASE(ctx);
@@ -1293,7 +1314,7 @@ int st20p_rx_timing_parser_critical(st20p_rx_handle handle,
 int st20p_rx_wake_block(st20p_rx_handle handle) {
   struct st20p_rx_ctx* ctx = handle;
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   if (ctx->block_get) rx_st20p_block_wake(ctx);
 
@@ -1304,7 +1325,7 @@ int st20p_rx_wake_block(st20p_rx_handle handle) {
 int st20p_rx_set_block_timeout(st20p_rx_handle handle, uint64_t timedwait_ns) {
   struct st20p_rx_ctx* ctx = handle;
 
-  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, 0);
+  MT_HANDLE_GUARD(ctx, MT_ST20_HANDLE_PIPELINE_RX, -EIO);
 
   ctx->block_timeout_ns = timedwait_ns;
   MT_HANDLE_RELEASE(ctx);

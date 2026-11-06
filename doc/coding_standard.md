@@ -37,9 +37,9 @@ change the result:
                                   |
              +--------------------+--------------------+
              |                    |                    |
-      ./checkpatch.sh      git pre-commit hook   .github/workflows/linter.yml
+      ./checkpatch.sh      git pre-commit hook   .github/workflows/cicd-pr-check.yml
              |                    |                    |
-       ./format-coding.sh    (same hooks)       (same hooks, 3 OSes)
+        ./format-coding.sh    (same hooks)     (same hooks, Linux and Windows)
 ```
 
 Every caller above runs the same hook list from the same file. None of them
@@ -53,7 +53,7 @@ contains a rule, a version, a file filter or a tool invocation of its own:
 | `.gitattributes` | line-ending normalization on checkout and check-in | anything else |
 | `checkpatch.sh` | which files to feed the engine, how to report | any rule |
 | `format-coding.sh` | thin write-mode wrapper over `checkpatch.sh` | any rule |
-| `.github/workflows/linter.yml` | orchestration: OS matrix, caching, Python setup | any rule or config path |
+| `.github/workflows/cicd-pr-check.yml` (lint jobs) | orchestration: OS matrix, caching, Python setup | any rule or config path |
 | this document | prose rationale and the parity table | rules that are not in the config |
 
 **Adding or changing a lint rule** means editing `.pre-commit-config.yaml` (and
@@ -82,19 +82,20 @@ reformat waiting to happen.
 | Language | Tool | Fixes | Rule file |
 |---|---|---|---|
 | any | pre-commit-hooks 6.0.0 -- five structural guards | no | -- |
-| C, C++ | clang-format 22.1.8 | yes | `.clang-format` |
-| Python | isort 8.0.1 (`--profile black`) | yes | -- |
-| Python | black 26.5.1 (`--line-length 88`) | yes | -- |
-| Python | flake8 7.3.0 | no | `.github/linters/.flake8` |
-| Python | ruff 0.16.3 | partly | `.github/linters/.ruff.toml` |
-| Shell | shfmt 3.13.1 | yes | `.editorconfig` (`[*.sh]`) |
+| C, C++ | clang-format 23.1.3 | yes | `.clang-format` |
+| Python | isort 9.0.2 (`--profile black`) | yes | -- |
+| Python | black 26.10.1 (`--line-length 88`) | yes | -- |
+| Python | flake8 7.4.1 | no | `.github/linters/.flake8` |
+| Python | ruff 0.17.1 | partly | `.github/linters/.ruff.toml` |
+| Shell | shfmt 3.14.1 | yes | `.editorconfig` (`[*.sh]`) |
 | Shell | shellcheck 0.11.0 | no | -- |
 | Markdown | markdownlint-cli 0.49.1 | yes | `.github/linters/.markdown-lint.yml` |
 | Markdown prose | textlint 15.8.0 + terminology 4.0.1 | yes | `.github/linters/.textlintrc` |
 | YAML | yamllint 1.38.0 | no | `.github/linters/.yaml-lint.yml` |
 | GitHub Actions | actionlint 1.7.12 | no | `.github/linters/actionlint.yaml` |
 | HTML | htmlhint 1.9.2 | no | `.github/linters/.htmlhintrc` |
-| staged diff | gitleaks 8.30.0 | no | -- |
+| staged diff | gitleaks 8.30.1 | no | -- |
+| CI path filters | `.github/scripts/ci/lint/check-path-filters.py` | no | `.github/path_filters.yml` |
 | commit message | gitlint 0.19.1 | no | `.github/linters/.gitlint` |
 
 The gitlint row is the one hook that does not run over files. It runs at the
@@ -126,7 +127,7 @@ down.** Both halves of that were learned the hard way here:
 flake8 and ruff both run, and the overlap is deliberate rather than accidental.
 `.ruff.toml` selects `E`, `W`, `F` -- flake8's own rule set, since flake8 declares
 no `select` either -- so the two are as close to interchangeable as they can be.
-They are not yet interchangeable in one direction: **ruff 0.16 does not implement
+They are not yet interchangeable in one direction: **ruff 0.17 does not implement
 F824** ("dead `global` declaration") at all; `ruff rule F824` answers "unknown
 rule". flake8 7.3 found two of them here, both genuinely dead. That single rule is
 the whole reason the flake8 hook still exists, which is also why its rule set is
@@ -228,18 +229,20 @@ Not every available check is enabled. These were considered and rejected, so tha
 
 The three must agree. Anything CI enforces that `checkpatch.sh` cannot reproduce
 is listed here explicitly, and runs in the `residual-linters` job of
-`.github/workflows/linter.yml`.
+`.github/workflows/cicd-pr-check.yml`.
 
 | CI check | Status | Why |
 |---|---|---|
 | clang-format, isort, black, flake8, ruff, shfmt, shellcheck, markdownlint, textlint, yamllint, actionlint, htmlhint | in `checkpatch.sh` | pinned by `.pre-commit-config.yaml`; each pin measured clean over the whole tree before adoption |
 | `VALIDATE_GITLEAKS` | residual | the hook scans the *staged diff*, so it cannot scan a whole tree or a pull request. Both run the same scanner at different scopes. `detect-private-key` covers the whole tree, but only for PEM blocks |
 | `VALIDATE_BASH_EXEC` | residual | `*.sh` must keep its executable bit. No upstream hook has these exact semantics; the nearest one is broader and fails 17 files |
-| `VALIDATE_ENV` (dotenv-linter) | residual, **known landmine** | fails all 8 tracked `*.env` whole-tree; see the comment at that key in `linter.yml` |
-| `VALIDATE_TYPESCRIPT_ES` | residual | 135 `*.ts` files with no lintable project configuration from a clean clone: `.gitignore`'s blanket `*.json` leaves `tests/tools/perf_debug_mcp/package.json` untracked |
+| `VALIDATE_ENV` (dotenv-linter) | **dropped** | the slim image had no dotenv-linter before super-linter 6.8.0, so it never ran. From there on it fails all 11 tracked `*.env`, most of them path manifests rather than dotenv files |
+| `VALIDATE_TYPESCRIPT_ES` | residual | 135 `*.ts` files with no lintable project configuration from a clean clone: `.gitignore`'s blanket `*.json` leaves `tests/tools/perf_debug_mcp/package.json` untracked. `.github/linters/eslint.config.mjs` keeps it the parse check super-linter v6 ran |
 | `VALIDATE_RUST_*`, `VALIDATE_RUST_CLIPPY` | residual | rustfmt and clippy need a Rust toolchain per environment. Carried over unchanged rather than narrowed, since narrowing the edition list would be a rule change |
 | `VALIDATE_EDITORCONFIG` | **dropped** | it was default-on before, and enforced nothing: no `.editorconfig` existed. The one that exists now declares only `charset`, `end_of_line` and shfmt's shell indent, all of which the hooks or `.gitattributes` already cover |
 | commit-message style (gitlint) | own `commit-messages` job | a message is not a file, so `checkpatch.sh` cannot reach it. The job runs the same `commit-msg` hook over each PR commit that the git `commit-msg` hook runs locally, so version and rules stay in one place. Not in `residual-linters`: that is the super-linter allow-list, and MTL's capitalized, scope-free format is not one |
+| Bandit | `bandit` job of `cicd-pr-check.yml` | a security scan with a mandated test set, not a style rule. The test set is `.github/code-scan/bandit.config`, apart from the linter configs in `.github/linters/`. `task ci:bandit` reproduces the scan locally, with the Bandit release pinned in `.github/code-scan/requirements.txt`, which Dependabot updates |
+| clang-tidy, on the C and C++ lines a pull request changes | own `clang-tidy` job in `cicd-pr-check.yml` | it needs the compile commands of configured builds, which `checkpatch.sh` has no part in. The checks are `.clang-tidy`'s, run by `cpp-linter/cpp-linter-action`; the report is the `clang-tidy-report` artifact. After `./build.sh`, `clang-tidy-20 -p build <file>` runs them on one file locally |
 
 That job was a deny-list of nine `VALIDATE_*: false` keys and is now an
 **allow-list**, so anything not named above is no longer enforced -- the two real
@@ -248,20 +251,17 @@ cases are in the table, and a file type census found no tracked `*.js`, `*.css`,
 super-linter aborts if `true` and `false` are mixed, so no `VALIDATE_*: false`
 line may be added back.
 
-### 4.1. The build gate depends on these names
+### 4.1. The build waits for the file linters
 
-`.github/workflows/build.yml` will not build until the file linters have passed.
-The `Lint Code Base` job aggregates the three `checkpatch` matrix jobs and
-`Lint checks not yet in checkpatch`; the build's `wait-for-linter` job polls that
-one stable check-run name. A lint failure therefore skips the build rather than
-wasting a DPDK compile on it. Commit-message style remains an independent pull
-request check and does not block the compile.
+The `build` job of `.github/workflows/cicd-pr-check.yml` needs the `checkpatch`
+matrix jobs and `residual-linters` (`Lint checks not yet in checkpatch`). A lint
+failure therefore skips the build rather than wasting a DPDK compile on it, and
+`ci-result` fails. The `ci-result` job is the one branch-protection check for
+the workflow. It requires the file linters and commit-message check on pull
+requests. Commit-message style does not block the compile.
 
-The workflow coupling is by the aggregate job's `name:`. Renaming `Lint Code
-Base` without updating `build.yml` makes the gate wait for a check that never
-arrives and report a timeout, which looks like infrastructure failure instead of
-a configuration error. The aggregate keeps the matrix details visible without
-requiring consumers to duplicate every platform-specific check name.
+The coupling is by job ID in `needs:`, in one workflow, so GitHub refuses a
+rename of a lint job that does not also change the `build` job.
 
 ## 5. Git hooks
 
@@ -292,11 +292,11 @@ unstaged`. Stage the config, or use `--no-verify` while you iterate on it.
 ## 6. Platforms
 
 Any Linux distribution, macOS and Windows (git-bash / MSYS2) are supported, and
-CI runs `./checkpatch.sh` on Linux, macOS and Windows so the claim cannot rot. It
-had already rotted once before that job existed: a tracked filename containing a
-colon made the tree impossible to check out on Windows (see the `patches/` note in
-[§3](#3-what-is-checked)). `check-illegal-windows-names` now fails locally on
-any path Windows cannot represent, which is a cheaper place to find out.
+CI runs `./checkpatch.sh` on Linux and Windows. The cross-platform claim had
+already rotted once before that job existed: a tracked filename containing a
+colon made the tree impossible to check out on Windows (see the `patches/` note
+in [§3](#3-what-is-checked)). `check-illegal-windows-names` now fails locally
+on any path Windows cannot represent, which is a cheaper place to find out.
 
 ### 6.1. Installing the engine
 
@@ -341,8 +341,9 @@ newer merely to parse its own source, so an older system Node was a crash and a
 newer one was an unpinned variable.
 
 One thing genuinely *not* pinned is the engine: the config's floor is
-`minimum_pre_commit_version: 3.5.0`, CI runs 4.6.2, and a distribution package
-may be older than either. If a hook behaves differently for you than in CI, check
+`minimum_pre_commit_version: 3.5.0`, CI runs the release that
+`.github/linters/requirements.txt` locks, and a distribution package may be
+older than either. If a hook behaves differently for you than in CI, check
 `pre-commit --version` first -- CI is authoritative.
 
 ### 6.2. What the scripts avoid
@@ -379,7 +380,7 @@ for `feat` plus `build(deps)` for dependency bumps.
 
 The mechanical half of that format *is* automated, by gitlint. The
 `commit-msg` git hook runs it on every `git commit` locally, and the
-`commit-messages` job in `.github/workflows/linter.yml` runs the same hook over
+`commit-messages` job in `.github/workflows/cicd-pr-check.yml` runs the same hook over
 each commit a pull request adds. `checkpatch.sh` itself still checks only
 *files* -- it has no message to read -- so message linting rides the commit-msg
 stage, not a `checkpatch.sh` run. The rules are in `.github/linters/.gitlint`,
@@ -399,3 +400,21 @@ for that a regular expression cannot judge -- imperative mood, "explain why, not
 chat-or-process leakage, body wrapping -- stays a reviewer's call, in the same
 bucket as the two-world rule and the prefixes in
 [`.github/instructions/mtl-c-coding.instructions.md`](../.github/instructions/mtl-c-coding.instructions.md).
+
+## 8. Diagram colors
+
+The diagrams in `doc/png/` use the five palette colors.
+
+| Color | Hex | Use |
+| --- | --- | --- |
+| Intel Classic Blue | `#0068B5` | The MTL logo, `png/mtl_logo.svg` |
+
+| Hex | Use in the diagrams |
+| --- | --- |
+| `#1F271B` | Text, lines, arrows and borders |
+| `#0B4F6C` | Session blocks and the control plane panel |
+| `#145C9E` | The MTL block and the data plane panel |
+| `#CBB9A8` | Group panels, for example Pipeline API and Device |
+| `#DCC7BE` | Page background and labels |
+
+The logo letters are polygons. Thus, installed fonts do not change the logo.

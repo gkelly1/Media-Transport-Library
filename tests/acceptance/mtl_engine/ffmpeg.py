@@ -18,18 +18,14 @@ Lifecycle (single host only — these tests never split TX/RX across hosts):
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
-from mtl_engine import ffmpeg_app, ip_pools
-from mtl_engine.application_base import (
-    MTL_ENCODER_PLUGIN_MAP,
-    Application,
-    ProcSpec,
-    mtl_plugin_check_cmd,
-)
+from mtl_engine import ffmpeg_app, ip_pools, media_files
+from mtl_engine.application_base import Application, ProcSpec, st22_codec_devices_ok
 from mtl_engine.config.mappings import APP_NAME_MAP, ffmpeg_pix_fmt
 from mtl_engine.const import FFMPEG_EXE, RXTXAPP_EXE
-from mtl_engine.integrity_session import NO_INTEGRITY
+from mtl_engine.integrity_session import NO_INTEGRITY, IntegrityIntent
 from mtl_engine.pcap_compliance import NO_COMPLIANCE
 
 logger = logging.getLogger(__name__)
@@ -75,6 +71,8 @@ class FFmpeg(Application):
         self._tx_commands: list[str] = []
         self._build: str | None = None
         self._rx_output: str | None = None
+        self._tx_output: str | None = None
+        self._rx_frame_spec: tuple[str, str, int] | None = None
 
     # ------------------------------------------------------------------ ABCs
     def get_app_name(self) -> str:
@@ -83,41 +81,34 @@ class FFmpeg(Application):
     def get_executable_name(self) -> str:
         return APP_NAME_MAP["ffmpeg"]
 
-    def require_encoder(self, host, encoder: str, use_mtl_plugin: bool = False) -> None:
-        """Raise EnvironmentError if *encoder* is not available on *host*.
+    def rx_recording_cap(self) -> int:
+        """``rx_max_file_size`` becomes ``-fs`` on every raw st20p recording and
+        on the decoded st22p recording."""
+        mode = self._ff_params.get("mode")
+        if mode == _MODE_ST22P or (
+            mode == _MODE_YUV_H264
+            and self._ff_params.get("output_format", "yuv") == "yuv"
+        ):
+            return int(self.params.get("rx_max_file_size") or 0)
+        return 0
 
-        When *use_mtl_plugin* is True the codec is delivered by the MTL st22p
-        device (FFmpeg uses ``-f mtl_st22p``), so the matching MTL plugin .so is
-        checked instead of FFmpeg's built-in encoder list. Otherwise FFmpeg's
-        own encoder (e.g. ``-c:v libopenh264`` for an st20p YUV->H264 pipe) is
-        verified against ``ffmpeg -encoders``.
-        """
-        if use_mtl_plugin:
-            # Codecs delivered via MTL plugin (FFmpeg uses -f mtl_st22p)
-            plugin_so = MTL_ENCODER_PLUGIN_MAP.get(encoder)
-            if plugin_so:
-                res = host.connection.execute_command(
-                    mtl_plugin_check_cmd(plugin_so),
-                    shell=True,
-                    expected_return_codes=None,
-                )
-                if res.return_code != 0:
-                    raise EnvironmentError(
-                        f"MTL codec plugin {plugin_so} (for {encoder}) not found; "
-                        f"install the codec library and rebuild MTL plugins"
-                    )
-            return
+    def rx_output_files(self) -> list[str]:
+        """Every file the RX records to with ``output_file``: session ``k`` of a
+        multi-session run records to ``<output_file>_<k>``, as RxTxApp names
+        replicas, so that no name is a prefix of another."""
+        url = self.params.get("output_file")
+        if not url:
+            return []
+        if self._ff_params.get("multiple_sessions"):
+            return [f"{url}_{k}" for k in range(2)]
+        return [url]
 
-        res = host.connection.execute_command(
-            f"ffmpeg -encoders 2>/dev/null | grep {encoder} || true",
-            shell=True,
-            timeout=10,
-        )
-        if encoder not in (res.stdout or ""):
-            raise EnvironmentError(
-                f"{encoder} encoder not available in FFmpeg; "
-                f"install the codec library and rebuild FFmpeg"
-            )
+    def integrity_intents(self, test_repo_path: str, host) -> list[IntegrityIntent]:
+        """One intent per recording; both multi-session streams carry the same
+        source."""
+        intent = self.integrity_intent(test_repo_path, host)
+        paths = self.rx_output_files()
+        return [dataclasses.replace(intent, out_url=p) for p in paths] or [intent]
 
     # ----------------------------------------------------- param plumbing
     def set_params(self, **kwargs):
@@ -140,6 +131,14 @@ class FFmpeg(Application):
         f"{RXTXAPP_EXE} --config_file {{rx_cfg}} --test_time {{test_time}}"
     )
 
+    def _rx_dma(self) -> str:
+        """The RX side alone probes the DMA devices: vfio-pci gives a device
+        to one process, so a TX that probed first would leave none for RX."""
+        return "-dma_auto 1 " if self.params.get("dma_auto") else ""
+
+    def _rxtxapp_rx_dma(self) -> str:
+        return " --dma_auto" if self.params.get("dma_auto") else ""
+
     @staticmethod
     def _ffmpeg_st20p_tx_cmd(
         *,
@@ -152,6 +151,7 @@ class FFmpeg(Application):
         framerate=None,
         filter_v: str = "",
         udp_port: int = 20000,
+        extra_udp_ports: tuple = (),
         ptp_enable: bool = False,
         pacing_way=None,
     ) -> str:
@@ -159,12 +159,24 @@ class FFmpeg(Application):
 
         Used by every mode: yuv|h264 (raw 422p10le), rgb24 (yuv422p10be →
         rgb24 filter, single stream), rgb24_multiple (same, two streams).
-        ``framerate`` only emitted for the rgb24 family — yuv_h264 omits
-        ``-framerate`` because the source already carries the canonical fps.
-        ``filter_v`` is the full ``-filter:v <chain>`` token (empty by default).
-        ``ptp_enable`` is independent from ``pacing_way``.
+        ``framerate`` is a pXX label (or its bare integer); it is converted to
+        the exact rate before being handed to FFmpeg — see the ``-re`` note
+        below. ``filter_v`` is the full ``-filter:v <chain>`` token (empty by
+        default). ``ptp_enable`` is independent from ``pacing_way``.
         """
-        framerate_token = f"-framerate {framerate} " if framerate is not None else ""
+        # ``-framerate`` on the rawvideo demuxer is a real rate, not a SMPTE
+        # label, and combined with ``-re`` below it becomes a hard cap on the
+        # producer. Passing the label verbatim caps it at 29 fps while the
+        # mtl_st20p muxer scans the ST 2110 rates for the first whose tolerance
+        # window holds 29 -- ST_FPS_P29_97, window [28.97, 29.99] -- and paces
+        # at 30000/1001, so the pacer starves by ~1 frame/s and drops it
+        # (``TX_VIDEO_SESSION ... epoch drop``, ``busy as no ready frame from
+        # user``).
+        framerate_token = (
+            f"-framerate {media_files.pformat_to_exact_fps(framerate)} "
+            if framerate is not None
+            else ""
+        )
         filter_token = f"{filter_v} " if filter_v else ""
         ptp_token = ""
         if ptp_enable:
@@ -177,12 +189,20 @@ class FFmpeg(Application):
         # of the ST 2110-21 epoch (observed: 38.3 ms frame gaps instead of 40 ms,
         # drifting ~1.7 ms earlier per frame) and VRX goes deeply negative.
         # RxTxApp gets the same rate limiting implicitly from MTL back-pressure.
+        # ``extra_udp_ports`` adds further mtl_st20p outputs to this one process
+        # rather than starting another. The plugin refcounts a single mtl_init
+        # per process (mtl_common.c g_mtl_shared_handle), so sessions sharing a
+        # port must share a process; the muxer is AVFMT_NOFILE, so every output
+        # can keep the same ``-`` placeholder.
+        outputs = " ".join(
+            f"-p_port {port} -p_sip {sip} -p_tx_ip {mcast} "
+            f"-udp_port {p} -payload_type 112 {ptp_token}-f mtl_st20p -"
+            for p in (udp_port, *extra_udp_ports)
+        )
         return (
             f"{FFMPEG_EXE} -stream_loop -1 -re {framerate_token}"
             f"-video_size {video_size} -f rawvideo -pix_fmt {pix_fmt} "
-            f"-i {video_url} {filter_token}"
-            f"-p_port {port} -p_sip {sip} -p_tx_ip {mcast} "
-            f"-udp_port {udp_port} -payload_type 112 {ptp_token}-f mtl_st20p -"
+            f"-i {video_url} {filter_token}{outputs}"
         )
 
     def _create_command_and_config(self) -> tuple:
@@ -272,6 +292,9 @@ class FFmpeg(Application):
         else:
             pix_fmt = "yuv422p10le"
 
+        # Geometry and rate the command was actually built with, for validate_results().
+        self._rx_frame_spec = (video_size, pix_fmt, fps)
+
         rx_f_flag = "-f rawvideo" if output_format == "yuv" else "-c:v libopenh264"
 
         # IMPORTANT: -init_retry is an AVOption on the mtl_st20p *demuxer*, so
@@ -281,31 +304,40 @@ class FFmpeg(Application):
         # falls back to its default value of 5. With only 5 non-blocking
         # retries the RX tears down before TX finishes tv_train_pacing (~8s)
         # and the test fails with EIO + 0-byte output for every pix_fmt.
+        cap = self.rx_recording_cap()
+        fs_flag = f"-fs {cap} " if cap else ""
         if not multiple:
             rx_cmd = (
                 f"{FFMPEG_EXE} -p_port {nic_port_list[1]} "
-                f"-p_sip {ip_pools.rx[0]} "
+                f"-p_sip {ip_pools.rx[0]} {self._rx_dma()}"
                 f"-p_rx_ip {ip_pools.rx_multicast[0]} -udp_port 20000 "
                 f"-payload_type 112 -fps {fps} -pix_fmt {pix_fmt} "
                 f"-video_size {video_size} -init_retry 20 "
                 f"-f mtl_st20p -i k "
-                f"{rx_f_flag} {{out0}} -y"
+                f"{rx_f_flag} {fs_flag}{{out0}} -y"
             )
         else:
+            # Every input repeats the full device args, -p_sip included:
+            # mtl_dev_get() memcmps the requested mtl_init_params against the
+            # live shared handle, so an input that omits one asks for a
+            # different device (sip 0.0.0.0) and is refused with "shared handle
+            # configuration mismatch" -- reported by ffmpeg as "Error opening
+            # input file 2."
             rx_cmd = (
-                f"{FFMPEG_EXE} -p_sip {ip_pools.rx[0]} "
+                f"{FFMPEG_EXE} -p_sip {ip_pools.rx[0]} {self._rx_dma()}"
                 f"-p_port {nic_port_list[1]} "
                 f"-p_rx_ip {ip_pools.rx_multicast[0]} -udp_port 20000 "
                 f"-payload_type 112 -fps {fps} -pix_fmt {pix_fmt} "
                 f"-video_size {video_size} -init_retry 20 "
                 f"-f mtl_st20p -i 1 "
+                f"-p_sip {ip_pools.rx[0]} {self._rx_dma()}"
                 f"-p_port {nic_port_list[1]} "
                 f"-p_rx_ip {ip_pools.rx_multicast[0]} -udp_port 20002 "
                 f"-payload_type 112 -fps {fps} -pix_fmt {pix_fmt} "
                 f"-video_size {video_size} -init_retry 20 "
                 f"-f mtl_st20p -i 2 "
-                f"-map 0:0 {rx_f_flag} {{out0}} -y "
-                f"-map 1:0 {rx_f_flag} {{out1}} -y"
+                f"-map 0:0 {rx_f_flag} {fs_flag}{{out0}} -y "
+                f"-map 1:0 {rx_f_flag} {fs_flag}{{out1}} -y"
             )
 
         if tx_is_ffmpeg:
@@ -317,6 +349,10 @@ class FFmpeg(Application):
             # RxTxApp's convention: the pcap_capture fixture sniffs the second
             # NIC's PF, so TX must egress a different NIC or netsniff-ng only
             # sees switch-batched packets, making VRX measurement meaningless.
+            #
+            # The multiple_sessions RX above consumes udp 20000 and 20002, so TX
+            # must feed both -- otherwise input 1 has no sender, exhausts its
+            # -init_retry and takes the whole run down with EIO.
             self._tx_commands = [
                 self._ffmpeg_st20p_tx_cmd(
                     video_size=video_size,
@@ -326,6 +362,7 @@ class FFmpeg(Application):
                     sip=ip_pools.tx[0],
                     mcast=ip_pools.rx_multicast[0],
                     framerate=fps,
+                    extra_udp_ports=(20002,) if multiple else (),
                     ptp_enable=self.params.get("enable_ptp", False),
                     pacing_way=self.params.get("pacing_way"),
                 )
@@ -365,7 +402,7 @@ class FFmpeg(Application):
                 pacing_way=self.params.get("pacing_way"),
             )
         ]
-        return self._RXTXAPP_RX_TMPL, None
+        return self._RXTXAPP_RX_TMPL + self._rxtxapp_rx_dma(), None
 
     # -- mode: rgb24_multiple (FFmpeg TX×2, RxTxApp RX, two streams) -----
     def _build_rgb24_multiple_cmds(self, nic_port_list):
@@ -394,7 +431,7 @@ class FFmpeg(Application):
                     pacing_way=self.params.get("pacing_way"),
                 )
             )
-        return self._RXTXAPP_RX_TMPL, None
+        return self._RXTXAPP_RX_TMPL + self._rxtxapp_rx_dma(), None
 
     # -- mode: st22p (FFmpeg TX via mtl_st22p, FFmpeg RX via mtl_st22p) --
     def _build_st22p_cmds(self, nic_port_list):
@@ -404,9 +441,15 @@ class FFmpeg(Application):
         framerate = self.params.get("framerate", "p60")
         # Convert "pXX" string to numeric fps for FFmpeg -framerate flag.
         fps_num = framerate.lstrip("p") if isinstance(framerate, str) else framerate
+        # The fps filter sets a real rate, so it takes the exact one; MTL's own
+        # -fps option below resolves the label's digits itself.
+        filter_fps = media_files.pformat_to_exact_fps(framerate)
         pix_fmt = self._ff_params.get("pix_fmt", "yuv422p10le")
         st22_codec = self._ff_params.get("st22_codec", "jpegxs")
         bpp = self._ff_params.get("bpp", 3.0)
+        quality = self.params.get("quality", "speed")
+        # Non-default only: FFmpeg builds without -st22_quality reject the option.
+        quality_token = f"-st22_quality {quality} " if quality != "speed" else ""
         input_file = self.params.get("input_file") or self.params.get("video_url")
         udp_port = 20000
 
@@ -415,16 +458,21 @@ class FFmpeg(Application):
         codec_map = {"JPEG-XS": "jpegxs", "H264_CBR": "h264", "H265": "h265"}
         st22_codec = codec_map.get(codec_name, st22_codec)
 
+        # Geometry and rate of the decoded recording, for validate_results().
+        self._rx_frame_spec = (video_size, pix_fmt, self.extract_framerate(framerate))
+        cap = self.rx_recording_cap()
+        fs_flag = f"-fs {cap} " if cap else ""
+
         # TX: raw video → mtl_st22p muxer (encode + transmit)
         self._tx_commands = [
             f"{FFMPEG_EXE} -stream_loop -1 "
             f"-video_size {video_size} -f rawvideo -pix_fmt {pix_fmt} "
             f"-i {input_file} "
-            f"-filter:v fps={fps_num} "
+            f"-filter:v fps={filter_fps} "
             f"-p_port {nic_port_list[1]} -p_sip {ip_pools.tx[0]} "
             f"-p_tx_ip {ip_pools.rx_multicast[0]} "
             f"-udp_port {udp_port} -payload_type 112 "
-            f"-st22_codec {st22_codec} -bpp {bpp} "
+            f"-st22_codec {st22_codec} {quality_token}-bpp {bpp} "
             f"-f mtl_st22p -"
         ]
 
@@ -438,7 +486,7 @@ class FFmpeg(Application):
             f"-st22_codec {st22_codec} "
             f"-init_retry 20 "
             f"-f mtl_st22p -i k "
-            f"-f rawvideo {{out0}} -y"
+            f"-f rawvideo {fs_flag}{{out0}} -y"
         )
         return rx_cmd, None
 
@@ -544,10 +592,10 @@ class FFmpeg(Application):
             # cannot keep up the RX FFmpeg stalls, back-pressures MTL's frame
             # pool and starves the co-resident TX producer, which shows up as
             # ST 2110-21 pacing failures that have nothing to do with MTL.
-            out_path_param = self.params.get("output_file")
-            if out_path_param and not multiple:
-                self._output_files = [out_path_param]
-                host.connection.path(out_path_param).touch()
+            if self.params.get("output_file"):
+                self._output_files = self.rx_output_files()
+                for out_path in self._output_files:
+                    host.connection.path(out_path).touch()
             else:
                 self._output_files = ffmpeg_app.create_empty_output_files(
                     output_format, n, host, build
@@ -610,6 +658,11 @@ class FFmpeg(Application):
                 out_path = ffmpeg_app.create_empty_output_files(ext, 1, host, build)
                 self._output_files = out_path
             self.command = self.command.replace("{out0}", self._output_files[0])
+            if mode == _MODE_ST22P:
+                self.command = self.with_local_kahawai(self.command, build)
+                self._tx_commands = [
+                    self.with_local_kahawai(cmd, build) for cmd in self._tx_commands
+                ]
 
     # ----------------------------------------------------- execute_test
     def execute_test(  # type: ignore[override]
@@ -683,17 +736,18 @@ class FFmpeg(Application):
         )
         # RX is always specs[0] (started first); validation reads its output.
         self._rx_output = specs[0].captured_output
+        self._tx_output = "\n".join(spec.captured_output or "" for spec in specs[1:])
         self.last_output = self._rx_output
         self.last_return_code = self._safe_return_code(specs[0].proc)
 
-        integrity_intent = self.integrity_intent(build, host)
+        integrity_intents = self.integrity_intents(build, host)
 
         return self._finalize_run(
             compliance,
             intent,
             fail_on_error,
             integrity=integrity,
-            integrity_intent=integrity_intent,
+            integrity_intents=integrity_intents,
         )
 
     # ----------------------------------------------------- compliance
@@ -717,14 +771,29 @@ class FFmpeg(Application):
         try:
             if mode == _MODE_YUV_H264:
                 output_format = self._ff_params.get("output_format", "yuv")
-                video_format = self.params["video_format"]
-                video_size, _ = ffmpeg_app.decode_video_format_16_9(video_format)
                 video_url = self.params["video_url"]
                 if output_format == "yuv":
-                    passed = ffmpeg_app.check_output_video_yuv(
-                        self._output_files[0], host, build, video_url
+                    video_size, pix_fmt, fps = self._rx_frame_spec
+                    # Every session's recording, each checked and logged.
+                    passed = all(
+                        [
+                            ffmpeg_app.check_output_video_yuv(
+                                out_file,
+                                host,
+                                build,
+                                video_url,
+                                video_size,
+                                pix_fmt,
+                                fps,
+                                self.params.get("test_time") or 30,
+                                self.rx_recording_cap(),
+                            )
+                            for out_file in self._output_files
+                        ]
                     )
                 else:
+                    video_format = self.params["video_format"]
+                    video_size, _ = ffmpeg_app.decode_video_format_16_9(video_format)
                     passed = ffmpeg_app.check_output_video_h264(
                         self._output_files[0], video_size, host, build, video_url
                     )
@@ -736,7 +805,29 @@ class FFmpeg(Application):
                 passed = ffmpeg_app.check_output_rgb24(self._rx_output or "", 1)
             elif mode == _MODE_RGB24_MULTI:
                 passed = ffmpeg_app.check_output_rgb24(self._rx_output or "", 2)
-            elif mode in (_MODE_ST22P, _MODE_ST30P):
+            elif mode == _MODE_ST22P:
+                # st22p codecs are lossy, so the decoded frames cannot be
+                # byte-checked; count them instead.
+                video_size, pix_fmt, fps = self._rx_frame_spec
+                passed = ffmpeg_app.check_output_video_yuv(
+                    self._output_files[0],
+                    host,
+                    build,
+                    self.params.get("input_file"),
+                    video_size,
+                    pix_fmt,
+                    fps,
+                    self.params.get("test_time") or 30,
+                    self.rx_recording_cap(),
+                )
+                codec = self.params.get("codec", "JPEG-XS")
+                passed = (
+                    st22_codec_devices_ok(self._rx_output, codec, ("decoder",))
+                    and st22_codec_devices_ok(self._tx_output, codec, ("encoder",))
+                    and passed
+                )
+                self._cleanup_output_files(host)
+            elif mode == _MODE_ST30P:
                 # Basic validation: output file exists and is non-empty.
                 out_file = self._output_files[0] if self._output_files else None
                 if not out_file:
@@ -753,9 +844,7 @@ class FFmpeg(Application):
                     logger.error(f"{mode}: output file is empty: {out_file}")
                 # An integrity session, when the test asked for one, has already
                 # read this file: _finalize_run() evaluates it before
-                # validate_results() runs. Nothing downstream needs it, and a
-                # recording of a full test's traffic is far too large to leave
-                # in the workspace -- 1080p yuv422p10le is about 250 MB/s.
+                # validate_results() runs, and nothing downstream needs it.
                 self._cleanup_output_files(host)
             else:
                 self._fail_validation(f"Unknown mode {mode}", fail_on_error)

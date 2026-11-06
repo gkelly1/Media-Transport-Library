@@ -460,6 +460,57 @@ static void test_st20p_rx_user_meta(tests_context* s, struct st_frame* frame) {
   s->last_user_meta_frame_idx = meta->frame_idx;
 }
 
+/* MTL's own ST 2110-21 verdict on the received stream. Only the field-parity cause is
+ * asserted on -- the narrow/wide thresholds are load- and host-sensitive -- and other
+ * causes are logged. Matching failed_cause by string means a change to that text weakens
+ * this rather than breaking it; the deterministic guard is
+ * tests/unit/session/st20/interlaced_tp_phase_test.cpp. */
+static void test_st20p_rx_check_tp(tests_context* s, struct st_frame* frame) {
+  struct st20_rx_tp_meta* tp = frame->tp[MTL_SESSION_PORT_P];
+
+  if (!tp) {
+    s->incomplete_frame_cnt++;
+    return;
+  }
+  if (tp->compliant != ST_RX_TP_COMPLIANT_FAILED) return;
+  if (strcmp(tp->failed_cause, "field parity off frame grid")) {
+    if (!s->tp_other_fail_logged) {
+      err("%s(%d), timing parser not compliant, cause %s\n", __func__, s->idx,
+          tp->failed_cause);
+      s->tp_other_fail_logged = true;
+    }
+    return;
+  }
+  if (!s->tp_fail_cnt)
+    err("%s(%d), timing parser field parity off frame grid\n", __func__, s->idx);
+  s->tp_fail_cnt++;
+}
+
+/* ST 2110-21 6.2 frame grid: a first field starts on an even field slot, a second on an
+ * odd one, and a conforming FPT cannot tell the difference, so this is the only
+ * wire-level check for it. The basis is the 64-bit TAI first-packet time, NOT
+ * frame->rtp_timestamp: that one wraps, and 2^32 is not a multiple of the frame period in
+ * ticks, so its absolute phase is meaningless. Sound but probabilistic in power, since TX
+ * takes its starting parity from the wall clock -- the deterministic proof stays in
+ * tests/unit/session/st20_tx/interlaced_field_epoch_test.cpp. */
+static void test_st20p_rx_check_field_phase(tests_context* s, struct st_frame* frame) {
+  /* a zero basis would make the check below pass for every frame, so fail instead */
+  if (!frame->receive_timestamp) {
+    if (!s->field_phase_unverified_cnt)
+      err("%s(%d), no receive_timestamp, field phase unverifiable\n", __func__, s->idx);
+    s->field_phase_unverified_cnt++;
+    return;
+  }
+
+  uint64_t slot = (uint64_t)((double)frame->receive_timestamp / s->field_period_ns);
+
+  if (((slot & 0x1) != 0) == frame->second_field) return;
+  if (!s->field_phase_fail_cnt)
+    err("%s(%d), field phase mismatch, slot %" PRIu64 " second_field %d\n", __func__,
+        s->idx, slot, frame->second_field);
+  s->field_phase_fail_cnt++;
+}
+
 static void test_st20p_rx_frame_thread(void* args) {
   tests_context* s = (tests_context*)args;
   auto handle = s->handle;
@@ -495,9 +546,8 @@ static void test_st20p_rx_frame_thread(void* args) {
     dbg("%s(%d), timestamp %" PRIu64 "\n", __func__, s->idx, frame->timestamp);
     if (frame->timestamp == timestamp) s->incomplete_frame_cnt++;
     timestamp = frame->timestamp;
-    if (s->rx_timing_parser) {
-      if (!frame->tp[MTL_SESSION_PORT_P]) s->incomplete_frame_cnt++;
-    }
+    if (s->rx_timing_parser) test_st20p_rx_check_tp(s, frame);
+    if (s->field_period_ns) test_st20p_rx_check_field_phase(s, frame);
 
     /* check user timestamp if it has */
     if (s->user_timestamp && !s->user_pacing) {
@@ -577,6 +627,9 @@ static void test_internal_st20p_rx_frame_thread(void* args) {
     dbg("%s(%d), timestamp %" PRIu64 "\n", __func__, s->idx, frame->timestamp);
     if (frame->timestamp == timestamp) s->incomplete_frame_cnt++;
     timestamp = frame->timestamp;
+
+    if (s->rx_timing_parser) test_st20p_rx_check_tp(s, frame);
+    if (s->field_period_ns) test_st20p_rx_check_field_phase(s, frame);
 
     /* check user timestamp if it has */
     if (s->user_timestamp && !s->user_pacing) {
@@ -1066,6 +1119,10 @@ static void st20p_rx_digest_test(enum st_fps fps[], int width[], int height[],
     ops_rx.output_fmt = rx_fmt[i];
     ops_rx.transport_fmt = t_fmt[i];
     ops_rx.interlaced = para->interlace;
+    if (ops_rx.interlaced) {
+      /* must stay a double: rounding 16683333.33ns at 59.94 shifts the slot index */
+      test_ctx_rx[i]->field_period_ns = (double)NS_PER_S / st_frame_rate(fps[i]);
+    }
     ops_rx.transport_linesize = 0;
     ops_rx.device = para->device;
     ops_rx.framebuff_cnt = test_ctx_rx[i]->fb_cnt;
@@ -1208,6 +1265,9 @@ static void st20p_rx_digest_test(enum st_fps fps[], int width[], int height[],
     EXPECT_LE(test_ctx_rx[i]->incomplete_frame_cnt, 4);
     EXPECT_EQ(test_ctx_rx[i]->sha_fail_cnt, 0);
     EXPECT_LE(test_ctx_rx[i]->user_meta_fail_cnt, 2);
+    EXPECT_EQ(test_ctx_rx[i]->tp_fail_cnt, 0);
+    EXPECT_EQ(test_ctx_rx[i]->field_phase_fail_cnt, 0);
+    EXPECT_EQ(test_ctx_rx[i]->field_phase_unverified_cnt, 0);
     if (para->check_fps) {
       if (para->fail_interval || para->timeout_interval) {
         EXPECT_NEAR(framerate_rx[i], expect_framerate_rx[i],
@@ -1267,10 +1327,11 @@ TEST(St20p, digest_1080i_s2) {
   para.interlace = true;
   para.level = ST_TEST_LEVEL_MANDATORY;
   para.check_fps = false;
-  para.interlace = true;
   para.device = ST_PLUGIN_DEVICE_TEST_INTERNAL;
   para.ssrc = 54321;
   para.block_get = true;
+  /* runs the library's own field-parity verdict against a real interlaced stream */
+  para.rx_timing_parser = true;
 
   st20p_rx_digest_test(fps, width, height, tx_fmt, t_fmt, rx_fmt, &para);
 }
@@ -2277,4 +2338,95 @@ TEST(St20s, rx_get_stats_concurrent_free_no_uaf) {
 
 TEST(St20s, rx_reset_stats_concurrent_free_no_uaf) {
   st20p_rx_stats_concurrent_free_test(true);
+}
+
+#define EPOCH_DROP_TEST_UDP_PORT_ST20P (20100)
+
+static void st20p_tx_epoch_drop_test(bool user_pacing) {
+  auto ctx = (struct st_tests_context*)st_test_ctx();
+  auto st = ctx->handle;
+  int ret;
+  struct st20p_tx_ops ops_tx;
+
+  auto test_ctx = new tests_context();
+  ASSERT_TRUE(test_ctx != NULL);
+  test_ctx->idx = 0;
+  test_ctx->ctx = ctx;
+  test_ctx->fb_cnt = 3;
+
+  memset(&ops_tx, 0, sizeof(ops_tx));
+  ops_tx.name = "st20p_epoch_drop_test";
+  ops_tx.priv = test_ctx;
+  ops_tx.port.num_port = 1;
+  memcpy(ops_tx.port.dip_addr[MTL_SESSION_PORT_P], ctx->mcast_ip_addr[MTL_PORT_P],
+         MTL_IP_ADDR_LEN);
+  snprintf(ops_tx.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s",
+           ctx->para.port[MTL_PORT_P]);
+  ops_tx.port.udp_port[MTL_SESSION_PORT_P] = EPOCH_DROP_TEST_UDP_PORT_ST20P;
+  ops_tx.port.payload_type = 112;
+  ops_tx.width = 1920;
+  ops_tx.height = 1080;
+  ops_tx.fps = ST_FPS_P59_94;
+  ops_tx.input_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
+  ops_tx.transport_fmt = ST20_FMT_YUV_422_10BIT;
+  ops_tx.device = ST_PLUGIN_DEVICE_TEST;
+  ops_tx.framebuff_cnt = test_ctx->fb_cnt;
+  ops_tx.flags |= ST20P_TX_FLAG_BLOCK_GET;
+  if (user_pacing) {
+    ops_tx.flags |= ST20P_TX_FLAG_USER_PACING;
+    ops_tx.flags |= ST20P_TX_FLAG_USER_TIMESTAMP;
+  }
+
+  /* create after start, the path that reported bogus drops */
+  ret = mtl_start(st);
+  EXPECT_GE(ret, 0);
+  auto tx_handle = st20p_tx_create(st, &ops_tx);
+  ASSERT_TRUE(tx_handle != NULL);
+  ret = st20p_tx_set_block_timeout(tx_handle, NS_PER_S);
+  EXPECT_EQ(ret, 0);
+
+  test_ctx->handle = tx_handle;
+  test_ctx->stop = false;
+
+  auto tx_thread = std::thread(
+      [user_pacing](tests_context* s) {
+        auto handle = (st20p_tx_handle)s->handle;
+        auto st = s->ctx->handle;
+        while (!s->stop) {
+          auto frame = st20p_tx_get_frame(handle);
+          if (!frame) continue;
+          if (user_pacing) {
+            frame->tfmt = ST10_TIMESTAMP_FMT_TAI;
+            frame->timestamp = mtl_ptp_read_time(st) + 20 * 1000 * 1000; /* +20ms */
+          }
+          st20p_tx_put_frame(handle, frame);
+          s->fb_send++;
+        }
+      },
+      test_ctx);
+  sleep(5);
+
+  test_ctx->stop = true;
+  st20p_tx_wake_block(tx_handle);
+  tx_thread.join();
+
+  struct st20_tx_user_stats stats;
+  ret = st20p_tx_get_session_stats(tx_handle, &stats);
+  EXPECT_GE(ret, 0);
+  EXPECT_GT(test_ctx->fb_send, 0);
+  info("%s, user_pacing %d, fb_send %d, epoch_drop %" PRIu64 "\n", __func__, user_pacing,
+       test_ctx->fb_send, stats.common.stat_epoch_drop);
+  EXPECT_EQ(stats.common.stat_epoch_drop, 0);
+
+  ret = st20p_tx_free(tx_handle);
+  EXPECT_GE(ret, 0);
+  delete test_ctx;
+}
+
+TEST(St20p, tx_no_epoch_drop) {
+  st20p_tx_epoch_drop_test(false);
+}
+
+TEST(St20p, tx_user_pacing_no_epoch_drop) {
+  st20p_tx_epoch_drop_test(true);
 }

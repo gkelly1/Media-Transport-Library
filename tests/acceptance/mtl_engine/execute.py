@@ -3,7 +3,7 @@
 
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404 # runs commands the test suite builds from its config
 import threading
 import time
 from queue import Queue
@@ -287,7 +287,7 @@ def log_result_note(note: str):
 
 
 # Canonical list of MTL-related process names that may be left over
-# after a crash or timeout.  Mirrors .github/actions/cleanup/action.yml.
+# after a crash or timeout.  Mirrors the cleanup task of Taskfile.yml.
 #
 # DPDK's rte_eal_init renames the process main thread to "<argv0>_main"
 # via pthread_setname_np, truncated to TASK_COMM_LEN-1 = 15 chars. That
@@ -299,6 +299,7 @@ _MTL_APP_BASE_NAMES = [
     "RxTxApp",
     "KahawaiTest",
     "ffmpeg",
+    "gst-launch-1.0",
     "gtest.sh",
 ]
 

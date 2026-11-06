@@ -7,9 +7,14 @@
  * FIELD rate, and one st20p_tx_get_frame()/st20p_rx_get_frame() call carries
  * one field. pacing->frame_time (st_tx_video_session.c/st_rx_video_session.c)
  * is derived purely from ops.fps with no interlaced-specific halving, so with
- * fps set to the field rate it already represents one field period -- the
- * same St20pUserTimestamp math used for progressive sessions applies to
- * fields unmodified; no new strategy class is needed.
+ * fps set to the field rate it already represents one field period.
+ *
+ * Interlaced TX also pins the epoch parity to the ST 2110-21 6.2 frame grid. When
+ * the first request lands on an odd field slot every field moves one slot later.
+ * The strategy expects that shift in each field's RTP timestamp; it is uniform, so
+ * elapsed time from field 0 and the RTP steps are unaffected.
+ *
+ * See README.md, "Test catalogue".
  */
 
 #include "core/constants.hpp"
@@ -17,23 +22,52 @@
 #include "handlers/st20p_handler.hpp"
 #include "strategies/st20p_strategies.hpp"
 
+static_assert(kNoCtxPacingEarlyMaxNs == 0, "comments quote 0 us early");
+static_assert(kNoCtxPacingLateMaxNs == 10 * NS_PER_US, "comments quote +10 us");
+static_assert(kNoCtxPacingElapsedErrorMaxNs == 10 * NS_PER_US, "comments quote +-10 us");
+
+/* st20p_user_pacing_interlaced
+ * Config:    initStrictPacingContext(); one session TX TEST_PORT_1 -> RX TEST_PORT_2,
+ *            1080i50: kInterlaced, kFps = 50 fields/s (T = 20 ms), YUV 4:2:2 10-bit
+ *            BPM, 3 buffers; TX kTxFlags = USER_PACING.
+ * Plan:      t_user(n) = epoch n after start per field, start = the epoch at or after
+ *            PTP now + 800 ms (kSt20pUserPacingLeadNs).
+ * Expect:    on every field, St20pInterlacedUserPacingOracle with expected launch =
+ *            the 90 kHz tick of t_user(n) + TR_offset - VRX*trs, one field later if
+ *            field 0 lands on an odd frame-grid slot
+ *            0. interlaced, second_field == (n odd)   rxTestFrameModifier()
+ *            1-6 as in st20p_user_pacing (launch and RTP instant 0/+10 us,
+ *               kNoCtxPacingEarlyMaxNs, kNoCtxPacingLateMaxNs; elapsed +-10 us,
+ *               kNoCtxPacingElapsedErrorMaxNs; RTP == tick90k(expected launch),
+ *               step 1800)
+ *            in the test, after mtl_start():
+ *            7. getPacingParameters() == 0; TR_offset, trs, VRX > 0
+ *            after stop:
+ *            8. idx_tx > 0, idx_rx > 0, idx_tx == idx_rx
+ *            Every TX and RX field also passes the St20pHandler thread checks.
+ * Skip/Fail: as st20p_user_pacing (strict topology, NOCTX_REQUIRE_STRICT=1).
+ */
 TEST_F(NoCtxTest, st20p_user_pacing_interlaced) {
-  initDefaultContext();
+  initStrictPacingContext();
+  if (IsSkipped() || HasFatalFailure()) return;
+
+  constexpr bool kInterlaced = true;
+  constexpr enum st_fps kFps = ST_FPS_P50;
+  constexpr uint32_t kTxFlags = ST20P_TX_FLAG_USER_PACING;
 
   auto bundle = createSt20pHandlerBundle(
       /*createTx=*/true, /*createRx=*/true,
-      [](St20pHandler* handler) { return new St20pUserTimestamp(handler); },
+      [](St20pHandler* handler) { return new St20pInterlacedUserPacingOracle(handler); },
       [](St20pHandler* handler) {
-        handler->sessionsOpsTx.interlaced = true;
-        handler->sessionsOpsRx.interlaced = true;
-        handler->sessionsOpsTx.fps = ST_FPS_P50;
-        handler->sessionsOpsRx.fps = ST_FPS_P50;
-        handler->sessionsOpsTx.flags |= ST20P_TX_FLAG_USER_PACING;
+        handler->sessionsOpsTx.interlaced = kInterlaced;
+        handler->sessionsOpsRx.interlaced = kInterlaced;
+        handler->sessionsOpsTx.fps = kFps;
+        handler->sessionsOpsRx.fps = kFps;
+        handler->sessionsOpsTx.flags |= kTxFlags;
       });
 
-  auto* frameTestStrategy = static_cast<St20pUserTimestamp*>(bundle.strategy);
+  auto* frameTestStrategy = static_cast<St20pUserPacingOracle*>(bundle.strategy);
 
-  StartFakePtpClock();
   bundle.handler->startSession();
   mtl_start(ctx->handle);
 

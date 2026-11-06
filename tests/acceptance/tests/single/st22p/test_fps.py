@@ -12,6 +12,10 @@ from mtl_engine.media_files import yuv_files_422p10le
     [
         "rxtxapp",
         "ffmpeg",
+        pytest.param(
+            "gstreamer",
+            marks=pytest.mark.skip(reason="GStreamer does not support st22p pipeline"),
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -48,6 +52,7 @@ def test_st22p_fps(
     fps,
     codec,
     test_config,
+    output_files,
     media_file,
 ):
     """Test st22p at different frame rates."""
@@ -64,13 +69,6 @@ def test_st22p_fps(
     test_time = max(test_time, 90)
 
     app = app_factory(application)
-    codec_encoder_map = {
-        "H264_CBR": "libopenh264",
-        "JPEG-XS": "libsvt_jpegxs",
-    }
-    encoder = codec_encoder_map.get(codec)
-    if encoder:
-        app.require_encoder(host, encoder, use_mtl_plugin=True)
     app.create_command(
         session_type="st22p",
         test_mode="multicast",
@@ -82,6 +80,7 @@ def test_st22p_fps(
         quality="speed",
         pixel_format=media_file_info["file_format"],
         input_file=media_file_path,
+        output_file=output_files.register(f"{media_file_path}.out"),
         codec_threads=16,
         test_time=test_time,
     )

@@ -17,8 +17,8 @@ test.
 | Group            | Path                                                                                                   | Owns                                                                                                        |
 | ---------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | **Harness**      | `conftest.py` (~1.4k lines)                                                                            | Every fixture: topology load, host prep, VF pools, media staging, capture, clocks, logging, cleanup         |
-| **Host control** | `common/nicctl.py`, `common/host_setup.py`                                                             | `Nicctl` (VF create/bind), `InterfaceSetup` (per-test interface allocation), hugepages, PF up, CPU governor |
-| **Adapters**     | `mtl_engine/application_base.py`, `rxtxapp.py`, `ffmpeg.py`                                            | `Application` ABC + its two concrete subclasses: command building, process lifecycle, result validation     |
+| **Host control** | `common/nicctl.py`, `common/host_setup.py`                                                             | `Nicctl` (VF create/bind), `InterfaceSetup` (per-test interface allocation), hugepage check, PF up, CPU governor and turbo check |
+| **Adapters**     | `mtl_engine/application_base.py`, `rxtxapp.py`, `ffmpeg.py`, `gstreamer.py`                            | `Application` ABC + its three concrete subclasses: command building, process lifecycle, result validation   |
 | **Parameters**   | `mtl_engine/config/universal_params.py`, `rxtxapp_config.py`                                           | The single vocabulary of test knobs, and the RxTxApp JSON config template                                   |
 | **Media**        | `mtl_engine/media_files.py`, `media_creator.py`, `ramdisk.py`                                          | Curated asset registry with metadata; synthetic asset generation; tmpfs staging                             |
 | **Capture**      | `create_pcap_file/netsniff.py`, `mtl_engine/pcap_compliance.py`                                        | `NetsniffRecorder` (capture only) and `ComplianceSession` (capture lifecycle + EBU verdict)                 |
@@ -42,10 +42,11 @@ Each adapter implements four abstract methods and nothing more:
 (turn `self.params` into `(command, config_dict|None)`), and
 `validate_results(fail_on_error)` (the application-level oracle, [§5.1](#51-application-result)).
 
-`RxTxApp` and `FFmpeg` are therefore **siblings, not variants**. They share
-lifecycle, not behaviour: RxTxApp emits a JSON config plus one process;
-FFmpeg emits argv only and runs an RX process plus N TX processes. Neither
-can see the other's internals, and a third adapter can be added by
+`RxTxApp`, `FFmpeg` and `GStreamer` are therefore **siblings, not
+variants**. They share lifecycle, not behaviour: RxTxApp emits a JSON config
+plus one process; FFmpeg emits argv only and runs an RX process plus N TX
+processes; GStreamer runs one RX and one TX `gst-launch-1.0` pipeline. None
+can see another's internals, and a further adapter can be added by
 implementing the four methods without touching the existing ones.
 
 ### 2.2 One execution path, two topologies
@@ -67,9 +68,10 @@ invariants that are not obvious from the source:
    capture is also non-compliant — then re-raises once at the end.
 
 Where an adapter genuinely differs it overrides a concrete method and says
-why in a comment. `FFmpeg.execute_test()` is a full override because
-FFmpeg's traffic only flows once the *last* process is up, so it arms
-capture on `after_last_start` rather than `after_first_start`.
+why in a comment. `FFmpeg.execute_test()` and `GStreamer.execute_test()` are
+full overrides because their traffic only flows once the *last* process is
+up, so they arm capture on `after_last_start` rather than
+`after_first_start`.
 
 Dual-host runs a TX process on one host and an RX process on another and
 validates both applications. It does **not** capture packets; requesting
@@ -88,7 +90,9 @@ subclass). Migration is **unfinished**, so they are far from dead:
   adapter.
 * `ffmpeg_app.py` — command builders still called by the modern `ffmpeg.py`;
   its validation logic is not reused.
-* `GstreamerApp.py` — the only GStreamer path; no GStreamer adapter yet.
+* `GstreamerApp.py` — still the backend for `tests/dual/gstreamer/` and
+  `tests/single/gstreamer/anc_format/`; the shared st20p/st30p/st40p tests
+  use the `gstreamer.py` adapter.
 
 Do not extend these, and do not add a 29th `RxTxApp.py` importer. New work
 goes through `Application`.
@@ -196,8 +200,11 @@ Passing one oracle does not imply another ran. Tests opt in.
 ### 5.1 Application result
 
 Adapter-owned. RxTxApp parses per-session-type result markers from stdout;
-FFmpeg checks mode-specific output (frame counts, file sizes). This proves
-operation, not payload identity or standards conformance.
+FFmpeg checks mode-specific output (frame counts, file sizes); GStreamer
+checks the RX recording's frame count and MTL's per-interval RX rate. This
+proves operation, not payload identity or standards conformance. The one
+exception is GStreamer st40p, which no integrity check covers: its recording
+must repeat the input UDW.
 
 ### 5.2 Media integrity
 
@@ -217,7 +224,14 @@ to -- `FileVideoIntegrityRunner` (MD5-compares frames) for video sessions,
 `FileAudioIntegrityRunner` (compares sample buffers) for audio sessions,
 using size/count math from `mtl_engine/integrity.py`. A test that requests
 `media_integrity` but never dispatches it fails in teardown, same as
-`pcap_capture`.
+`pcap_capture`. RxTxApp builds one intent per st20p and st30p recording
+and evaluates every one, so one failing recording cannot hide another;
+st22p is lossy and the other types have no checker. Replica `k` of a
+replicated receiver records to `<url>_<k>`, which gets an intent of its
+own. A test that records with `replicas > 1` divides `rx_max_file_size`
+by `replicas` so that the recordings fit the ramdisk together. FFmpeg
+multi-session runs do the same: session `k` records to `<url>_<k>`,
+each session gets its own intent, and the test splits the cap.
 
 The two dual-host integrity tests
 (`tests/dual/st20p/integrity/`, `tests/dual/st30p/integrity/`) still call
@@ -242,8 +256,9 @@ heuristic. Prefer explicit in CI; it documents the wiring.
 
 `evaluate()` uploads the pcap to EBU LIST and fails the test when the report
 disagrees with the `CaptureIntent` — ST 2110-21 schedule (narrow or
-narrow_linear unless `allow_wide_compliance`), packing mode, resolution,
-sampling + colour depth, and frame rate. A failed upload or an unparseable
+narrow_linear unless `allow_wide_compliance`), packing mode, resolution and
+frame rate. Sampling and colour depth are not checked: EBU LIST reports
+YCbCr-4:2:2 10-bit for every video stream. A failed upload or an unparseable
 response fails the test; it never silently passes. Capture is disabled for
 8K, which the analyser does not support. A test that requests `pcap_capture`
 but never dispatches it fails in teardown.

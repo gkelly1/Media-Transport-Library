@@ -1,11 +1,22 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: /
+    # The workflows and the composite actions they call
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: "monthly"
     commit-message:
       prefix: "Ci: "
+    # One pull request per run, not one per action
+    groups:
+      actions:
+        patterns: ["*"]
+    # The workflows pin this action to a commit of main, so each push to main
+    # outdates the pin. Bump it by hand when the action changes.
+    ignore:
+      - dependency-name: OpenVisualCloud/Media-Transport-Library/.github/actions/checkout-clean
 
   - package-ecosystem: pip
     directory: /tests
@@ -13,9 +24,29 @@ updates:
       interval: "monthly"
     commit-message:
       prefix: "Ci: "
+    groups:
+      tests:
+        patterns: ["*"]
 
+  # The Bandit and CodeChecker releases of the Code scan workflow
   - package-ecosystem: pip
-    directory: /python
+    directory: /.github/code-scan
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "Ci: "
+
+  # The pre-commit release of the Linter workflow
+  - package-ecosystem: pip
+    directory: /.github/linters
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "Ci: "
+
+  # What the nightly report scripts import
+  - package-ecosystem: pip
+    directory: /.github/scripts/ci/report
     schedule:
       interval: "monthly"
     commit-message:
@@ -34,6 +65,10 @@ updates:
       interval: "monthly"
     commit-message:
       prefix: "Ci: "
+    # Digest updates only: the manager image stays on Ubuntu 24.04 LTS.
+    ignore:
+      - dependency-name: ubuntu
+        versions: [">24.04"]
 
   - package-ecosystem: docker
     directory: /docker
@@ -41,3 +76,7 @@ updates:
       interval: "monthly"
     commit-message:
       prefix: "Ci: "
+    # Digest updates only: each image stays on the release its Dockerfile names.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

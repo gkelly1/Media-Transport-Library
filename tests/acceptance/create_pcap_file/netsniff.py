@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 STARTUP_WAIT = 2  # Default wait time after starting the process
 _REAP_GRACE_SEC = 0.3  # Grace period between SIGTERM and SIGKILL for the capture
 
+_PCAP_HEADER_BYTES = 24  # written when netsniff-ng opens the file, before any packet
+DROP_AFTER_TAP_PREF = 2110  # tc filter preference of the capture's drop rules
+_DST_IP_RE = re.compile(r"\bdst (\d+)\.(\d+)\.(\d+)\.(\d+)\b")
+
 # pgroup size (octets) and coverage (pixels) per sampling system and bit depth,
 # from SMPTE ST 2110-20:2022 tables 1 (4:4:4), 2 (4:2:2) and 3 (4:2:0). Keyed by
 # the MTL transport-format name used in mtl_engine.media_files ("format").
@@ -31,6 +35,8 @@ _PGROUPS = {
 }
 _DEFAULT_PGROUP = (5, 2)  # 4:2:2 10-bit
 _BPM_PAYLOAD_SIZE = 1260  # ST_VIDEO_BPM_SIZE in lib/src/st2110/st_header.h
+_RING_BYTES_PER_PACKET = 2048
+_MIN_RING_MIB = 64
 
 
 def _pgroup_for(transport_format: str | None) -> tuple[int, int]:
@@ -82,6 +88,22 @@ def calculate_packets_per_frame(media_file_info, mtu: int = 1500) -> int:
     return packets
 
 
+def _ring_size_mib(packets_capture: int) -> int:
+    """RX ring size for ``netsniff-ng --ring-size`` on a counted capture.
+
+    netsniff-ng's default ring is two seconds of line rate -- 23.3 GiB on a
+    100 GbE port -- taken from kernel memory at start. On a runner that keeps
+    most of its RAM as hugepages, that ring drives the host into direct reclaim
+    and swap for seconds, and the receiver under test drops frames. The ring
+    holds the whole capture instead, at <= 2 KiB per MTU-sized packet with its
+    TPACKET_V3 header, so a video capture cannot overflow however late
+    netsniff-ng drains it. The floor is for low-rate streams, whose ring blocks
+    the kernel hands over part-filled when the block timeout expires.
+    """
+    ring_bytes = packets_capture * _RING_BYTES_PER_PACKET
+    return max(_MIN_RING_MIB, math.ceil(ring_bytes / 2**20))
+
+
 class NetsniffRecorder:
     """
     Class to handle the recording of network traffic using netsniff-ng.
@@ -125,6 +147,27 @@ class NetsniffRecorder:
         self.packets_capture = packets_capture
         self.capture_time = capture_time
         self._promisc_was_off = False
+        self._drop_rules = False
+        self._clsact_added = False
+
+    def _captured_any_packet(self, connection) -> bool:
+        """True if the capture file already holds at least one packet.
+
+        A ``--num`` capture can be over before ``start()`` gets to check whether
+        the process is alive: the 65832 packets of a 4-frame 4K/119.88 capture
+        arrive in 33 ms, well inside the round trip that polls it. So "not
+        running" means "already finished" as often as it means "failed to start",
+        and the two differ only by whether a pcap exists -- netsniff-ng writes
+        the file header on open, so a capture that ran is strictly larger.
+        """
+        res = connection.execute_command(
+            f"stat -c %s '{self.pcap_file}' 2>/dev/null || echo 0",
+            expected_return_codes=None,
+        )
+        try:
+            return int((res.stdout or "0").strip()) > _PCAP_HEADER_BYTES
+        except ValueError:
+            return False
 
     @staticmethod
     def _sanitize_filename_component(value: str, *, max_len: int = 64) -> str:
@@ -169,6 +212,7 @@ class NetsniffRecorder:
             connection = self.host.connection
             self._enable_promisc(connection)
             try:
+                self._drop_after_tap(connection)
                 self.pcap_file = self._build_pcap_path()
                 # netsniff-ng needs privilege for two separate things: it raises
                 # /proc/sys/net/core/{r,w}mem_max, and it opens a PF_PACKET
@@ -197,6 +241,7 @@ class NetsniffRecorder:
                     "-T",
                     "0xa1b23c4d",
                     (
+                        f"--ring-size {_ring_size_mib(self.packets_capture)}MiB "
                         f"--num {self.packets_capture}"
                         if self.packets_capture is not None
                         else ""
@@ -210,10 +255,14 @@ class NetsniffRecorder:
                 logger.info(f"PCAP file will be saved at: {self.pcap_file}")
 
                 if not self.netsniff_process.running:
+                    if self._captured_any_packet(connection):
+                        logger.info("netsniff-ng already finished the capture.")
+                        return True
                     err = self.netsniff_process.stdout_text
                     logger.error(f"netsniff-ng failed to start. Error output:\n{err}")
                     # No pcap was written; clear so teardown skips upload.
                     self.pcap_file = None
+                    self._undo_drop_after_tap()
                     self._restore_promisc()
                     return False
                 logger.info(
@@ -223,6 +272,7 @@ class NetsniffRecorder:
             except ConnectionCalledProcessError as e:
                 logger.error(f"Failed to start netsniff-ng: {e}")
                 self.pcap_file = None
+                self._undo_drop_after_tap()
                 self._restore_promisc()
                 return False
 
@@ -250,7 +300,8 @@ class NetsniffRecorder:
                     # Use effective_capture_time as timeout to allow full test duration for packet capture
                     timeout = (effective_capture_time or 0) + 10
 
-                    self.netsniff_process.wait(timeout=timeout)
+                    if self.netsniff_process.running:
+                        self.netsniff_process.wait(timeout=timeout)
                     logger.info("Capture complete.")
                     logger.debug(self.netsniff_process.stdout_text)
                 except RemoteProcessTimeoutExpired:
@@ -268,12 +319,16 @@ class NetsniffRecorder:
         """
         if not self.netsniff_process:
             logger.debug("No netsniff-ng process to stop.")
+            # start() may have raised after changing the netdev.
+            self._undo_drop_after_tap()
+            self._restore_promisc()
             return
 
         # Check if process is still running before trying to stop
         if not self.netsniff_process.running:
             logger.debug("netsniff-ng process has already finished.")
             self._reap()
+            self._undo_drop_after_tap()
             self._restore_promisc()
             return
 
@@ -291,16 +346,17 @@ class NetsniffRecorder:
             logger.debug("netsniff-ng process stopped gracefully.")
         finally:
             self._reap()
+            self._undo_drop_after_tap()
             self._restore_promisc()
 
     def _reap(self):
         """Make sure no root ``netsniff-ng`` survives the process handle.
 
-        ``start_process("sudo netsniff-ng ...")`` runs under ``bash -c``, so the
-        handle above signals the bash wrapper and sudo does not pass the signal
-        on to its child. The capture therefore keeps running as root, reparented
-        to PID 1: it grows the pcap while it is being uploaded and holds the
-        interface open for the next test. This is the same reason
+        The pid of ``start_process("sudo netsniff-ng ...")`` is the root
+        ``sudo``: when the SSH user is not root, the handle's kill above fails
+        with EPERM. The capture then keeps running as root: it grows the pcap
+        while it is being uploaded and holds the interface open for the next
+        test. This is the same reason
         ``conftest._reap_ptp_daemons`` reaps ptp4l/phc2sys by argv, and the fix
         is the same -- ``pkill`` on the argv rather than on the handle.
 
@@ -342,7 +398,7 @@ class NetsniffRecorder:
                 return
             flags = (res.stdout or "").upper()
             if "PROMISC" in flags:
-                self._promisc_was_off = False
+                # Keeps ownership when an earlier start() is what turned it on.
                 return
             set_res = connection.execute_command(
                 f"sudo ip link set dev {self.interface} promisc on",
@@ -375,6 +431,92 @@ class NetsniffRecorder:
             logger.warning("Could not restore promisc on %s: %s", self.interface, e)
         finally:
             self._promisc_was_off = False
+
+    def _multicast_dst_ips(self) -> list[str]:
+        ips = []
+        for m in _DST_IP_RE.finditer(self.capture_filter or ""):
+            if 224 <= int(m.group(1)) <= 239:
+                ips.append(".".join(m.groups()))
+        return ips
+
+    def _drop_after_tap(self, connection):
+        """Drop the captured multicast in software right after the capture tap.
+
+        The promiscuous PF hands every packet of the stream to the host IP
+        stack, where netfilter (the Docker/k3s rule sets, conntrack) costs so
+        much per packet that the RX queue falls behind at ~1 Mpps (UHD 50/60)
+        and the NIC drops ~40% of the stream before netsniff-ng sees it. A tc
+        ingress rule runs after the packet taps, so the capture still gets
+        every packet, while the IP stack gets none of this multicast.
+        skip_hw keeps the NIC from dropping it before the tap. This assumes no
+        kernel UDP socket on this netdev receives these groups (MTL receives
+        them on a VF, or with native AF_XDP before tc): an MTL ``kernel:`` port
+        on the capture netdev would lose them. Unicast is left alone.
+        """
+        ips = self._multicast_dst_ips()
+        if not ips:
+            return
+        dev = self.interface
+        self._drop_rules = True  # undo is idempotent, so arm it before any change
+        res = connection.execute_command(
+            f"sudo tc qdisc add dev {dev} clsact", expected_return_codes=None
+        )
+        self._clsact_added = self._clsact_added or res.return_code == 0
+        # Replaces a killed test's or an earlier start()'s rules; flower rejects a
+        # duplicate key.
+        connection.execute_command(
+            f"sudo tc filter del dev {dev} ingress pref {DROP_AFTER_TAP_PREF}",
+            expected_return_codes=None,
+        )
+        for ip in ips:
+            res = connection.execute_command(
+                f"sudo tc filter add dev {dev} ingress pref {DROP_AFTER_TAP_PREF} "
+                f"protocol ip flower skip_hw dst_ip {ip} action drop",
+                expected_return_codes=None,
+            )
+            if res.return_code != 0:
+                logger.warning(
+                    "Could not drop %s after the capture tap on %s: %s",
+                    ip,
+                    dev,
+                    (res.stderr or res.stdout or "").strip(),
+                )
+        logger.debug("Dropping %s after the capture tap on %s", ips, dev)
+
+    def _undo_drop_after_tap(self):
+        if not self._drop_rules:
+            return
+        dev = self.interface
+        connection = self.host.connection
+        try:
+            res = connection.execute_command(
+                f"sudo tc filter del dev {dev} ingress pref {DROP_AFTER_TAP_PREF}",
+                expected_return_codes=None,
+            )
+            if res.return_code != 0:
+                logger.warning(
+                    "Could not remove the capture drop on %s, the multicast stays "
+                    "dropped for the host: %s",
+                    dev,
+                    (res.stderr or res.stdout or "").strip(),
+                )
+            # Remove the qdisc only if it is ours and nobody added filters to it.
+            if self._clsact_added:
+                res = connection.execute_command(
+                    f"tc filter show dev {dev} ingress; tc filter show dev {dev} egress",
+                    shell=True,
+                    expected_return_codes=None,
+                )
+                if not (res.stdout or "").strip():
+                    connection.execute_command(
+                        f"sudo tc qdisc del dev {dev} clsact",
+                        expected_return_codes=None,
+                    )
+        except Exception as e:
+            logger.warning("Could not remove the capture drop on %s: %s", dev, e)
+        finally:
+            self._drop_rules = False
+            self._clsact_added = False
 
     def update_filter(self, src_ip=None, dst_ip=None):
         """

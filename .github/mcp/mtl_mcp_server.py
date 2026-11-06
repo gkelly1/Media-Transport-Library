@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
+import subprocess  # nosec B404 # tool args are validated before reaching a shell
 import textwrap
 import threading
 import time
@@ -108,23 +108,11 @@ def _exclude_noctx_tests(gtest_filter: str) -> str:
 
 
 def _test_runtime_env() -> dict[str, str]:
-    """Prefer the MTL and DPDK libraries installed by this checkout."""
-    install_root = REPO_ROOT / ".local_install"
-    library_dirs: list[Path] = []
-    for component in ("mtl", "dpdk"):
-        lib_root = install_root / component / "lib"
-        multiarch_dirs = sorted(
-            path for path in lib_root.glob("*-linux-gnu") if path.is_dir()
-        )
-        library_dirs.extend(multiarch_dirs)
-        if not multiarch_dirs and lib_root.is_dir():
-            library_dirs.append(lib_root)
-
-    existing = os.environ.get("LD_LIBRARY_PATH", "")
-    entries = [str(path) for path in library_dirs]
-    if existing:
-        entries.append(existing)
-    return {"LD_LIBRARY_PATH": os.pathsep.join(entries)}
+    """No library path: a build tree carries meson's build rpath, and a prefix
+    install records its libraries relative to itself ($ORIGIN). An inherited
+    LD_LIBRARY_PATH would make a run validate whatever library it points at,
+    so clear it; the loader ignores an empty value."""
+    return {"LD_LIBRARY_PATH": ""}
 
 
 def _noctx_failure_excerpt(out: str) -> str:
@@ -639,7 +627,7 @@ def setup_after_reboot_auto(
     Steps:
     1. Check the ICE driver; if the stock kernel driver is loaded or the
        version doesn't match (e.g. after a kernel upgrade), rebuild the
-       patched out-of-tree driver automatically. This destroys any existing
+       out-of-tree driver automatically. This destroys any existing
        VFs, which step 6 below re-creates, so it must run first.
     2. Ensure hugepages
     3. Set CPU scaling governor to performance and confirm
@@ -665,7 +653,7 @@ def setup_after_reboot_auto(
     # pass and a second round-trip through this tool.
     ice = ice_driver_status()
     if "ACTION NEEDED" in ice:
-        results.append("## ICE Driver: rebuilding patched out-of-tree module")
+        results.append("## ICE Driver: rebuilding out-of-tree module")
         results.append(ice_driver_rebuild())
 
     results.append(hugepages_set(nr_hugepages))
@@ -744,7 +732,7 @@ def vfio_setup() -> str:
 def ice_driver_status() -> str:
     """
     Check the ICE driver status: loaded version vs required version,
-    module path, and whether it's the patched out-of-tree build.
+    module path, and whether it's the out-of-tree build.
     """
     return _ice_driver_status_impl()
 
@@ -752,10 +740,10 @@ def ice_driver_status() -> str:
 @mcp.tool()
 def ice_driver_rebuild() -> str:
     """
-    Build and install the patched out-of-tree ICE driver.
+    Build and install the out-of-tree ICE driver.
 
-    Downloads the correct ICE version from versions.env, applies MTL patches,
-    builds, and installs. Reloads the module afterwards.
+    Downloads the ICE version from versions.env, applies the MTL patches of a
+    version before 2.7.6, builds, and installs. Reloads the module afterwards.
 
     WARNING: This will briefly disconnect NICs using the ice driver.
     """
@@ -1135,6 +1123,7 @@ def run_gtest(
     dma_dev: str = "",
     timeout_seconds: int = 600,
     auto_start_stop: bool = True,
+    level: str = "",
 ) -> str:
     """
     Run MTL integration tests (KahawaiTest).
@@ -1149,6 +1138,9 @@ def run_gtest(
         dma_dev: Comma-separated DMA devices for DMA tests (e.g. '0000:00:01.0,0000:00:01.1').
         timeout_seconds: Max seconds for test run (default 600).
         auto_start_stop: Pass --auto_start_stop flag (default True).
+        level: Test level, 'all' or 'mandatory'. Binary default (mandatory-only) if empty.
+            Non-mandatory cases (gated ST_TEST_LEVEL_ALL) silently no-op unless 'all' is
+            passed here -- they still report PASS at 0ms, so a real run must set this.
     """
     binary = REPO_ROOT / "build/tests/KahawaiTest"
     if not binary.is_file():
@@ -1186,6 +1178,9 @@ def run_gtest(
     if gtest_filter and not re.match(r"^[a-zA-Z0-9_.*:/-]+$", gtest_filter):
         return "Error: invalid gtest_filter characters. Use alphanumeric, *, ., :, /, -"
 
+    if level and level not in ("all", "mandatory"):
+        return "Error: level must be 'all' or 'mandatory'"
+
     # NoCtxTest cases require one KahawaiTest process per test (DPDK EAL
     # cannot be re-initialised within a single process) plus the --no_ctx /
     # --no_ctx_tests flags this tool doesn't pass. Running them here would
@@ -1202,6 +1197,8 @@ def run_gtest(
         cmd_parts.append("--auto_start_stop")
     if dma_dev:
         cmd_parts.extend(["--dma_dev", dma_dev])
+    if level:
+        cmd_parts.extend(["--level", level])
     cmd_parts.append(f"--gtest_filter={_exclude_noctx_tests(gtest_filter)}")
 
     out = _run_output(cmd_parts, timeout=timeout_seconds, env=_test_runtime_env())

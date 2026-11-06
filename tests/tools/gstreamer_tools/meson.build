@@ -6,6 +6,12 @@ project('gstreamer_mtl_tools', 'c',
 
 cc = meson.get_compiler('c')
 
+# Compiler hardening, see doc/build.md
+hardening = run_command(files('../../../script/hardening_flags.py'), 'c', get_option('optimization'),
+  get_option('b_sanitize'), cc.cmd_array(), get_option('c_args'), check : true).stdout().split('\n')
+add_project_arguments(hardening[0].split(), language : 'c')
+add_project_link_arguments(hardening[1].split(), language : 'c')
+
 plugins_install_dir = join_paths(get_option('libdir'), 'gstreamer-1.0')
 
 plugin_c_args = [
@@ -20,6 +26,15 @@ plugin_c_args = [
 gst_dep = dependency('gstreamer-1.0', version : '>=1.19', required : true)
 gstbase_dep = dependency('gstreamer-base-1.0', version : '>=1.19', required : true)
 mtl_dep = dependency('mtl', required : true)
+
+# The plugins load with no LD_LIBRARY_PATH set: each one records where its
+# shared helper library (beside it) and, through the rpath option, MTL and
+# DPDK are, relative to itself. install_rpath: meson drops a plain rpath that
+# repeats a dependency's link directory.
+plugin_rpath = '$ORIGIN'
+if get_option('rpath') != ''
+  plugin_rpath += ':' + get_option('rpath')
+endif
 
 if run_command('test', '-d', '/usr/local/include/gstreamer-1.0', check: false).returncode() == 0
     gstreamer_inc_dir  = '/usr/local/include/gstreamer-1.0'
@@ -43,6 +58,7 @@ gst_mtl_anc_generator = library('ancgenerator',
   dependencies : [gst_dep, gstbase_dep, mtl_dep],
   install : true,
   install_dir : plugins_install_dir,
+  install_rpath : plugin_rpath,
   include_directories: inc_dirs,
   c_args: plugin_c_args
 )
@@ -52,6 +68,7 @@ gst_mtl_time_inserter = library('timeinserter',
   dependencies : [gst_dep, gstbase_dep, mtl_dep],
   install : true,
   install_dir : plugins_install_dir,
+  install_rpath : plugin_rpath,
   include_directories: inc_dirs,
   c_args: plugin_c_args
 )

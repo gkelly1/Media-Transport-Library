@@ -10,7 +10,7 @@ These rules are **mandatory** for all C source in the MTL codebase. For deep arc
 
 ## Language
 
-- Library core (`lib/`): **C99 only**. No C++ constructs.
+- Library core (`lib/`): **C99**, plus C11 `<stdatomic.h>` atomics (`_Atomic`, `atomic_*_explicit`) already used in the handle guard and pipeline headers. Meson sets no `c_std`, so the compiler default applies. No C++ constructs.
 - Tests (`tests/`): C++ allowed (gtest framework).
 
 ## Naming Conventions
@@ -20,12 +20,11 @@ These rules are **mandatory** for all C source in the MTL codebase. For deep arc
 | `mt_` | Core library internals (non-media) | `mt_socket_id()`, `mt_rte_zmalloc()` |
 | `mtl_` | Public core API | `mtl_start()`, `mtl_stop()` |
 | `st_` | ST2110 base abstractions | `st_frame_fmt_name()` |
-| `st20_`/`st22_`/`st30_`/`st40_`/`st41_` | Media session APIs | `st20_tx_create()` |
-| `st20p_`/`st22p_`/`st30p_` | Pipeline APIs | `st20p_tx_create()` |
+| `st20_`/`st22_`/`st30_`/`st40_` | Media session APIs | `st20_tx_create()` |
+| `st20p_`/`st22p_`/`st30p_`/`st40p_` | Pipeline APIs | `st20p_tx_create()` |
 | `tv_`/`rv_` | TX/RX video session internals | `tv_frame_free()` |
 | `tx_audio_session_`/`rx_audio_session_` | Audio internals | |
 | `tx_ancillary_session_`/`rx_ancillary_session_` | Ancillary internals | |
-| `tx_fastmetadata_`/`rx_fastmetadata_` | ST2110-41 internals | |
 
 ## Data-Plane vs Control-Plane Separation (Two-World Rule)
 
@@ -34,6 +33,7 @@ These rules are **mandatory** for all C source in the MTL codebase. For deep arc
 - No `pthread_mutex` — use `rte_spinlock_t` (never sleeps)
 - No INFO-level logging — only DEBUG/trace in hot paths
 - No `sleep`, no blocking I/O
+- No libc `rand()`/`random()` from tasklet context — glibc serializes them on a process-global lock; use `rte_drand()`/`rte_rand_max()`, but only where a skewed draw is tolerable: they are lock-free per-lcore on EAL lcores, yet all `MTL_FLAG_TASKLET_THREAD` schedulers share one unsynchronized state (see [§2](../copilot-docs/mtl-knowledge-base.md))
 - Use lock-free rings, zero-copy, polling tasklets
 
 **Control-plane** (session create/destroy, config) may use heap memory, mutexes, POSIX threads.
@@ -54,7 +54,7 @@ These rules are **mandatory** for all C source in the MTL codebase. For deep arc
 
 - DPDK allocations: `mt_rte_zmalloc()` / `mt_rte_free()` — always specify `socket_id` via `mt_socket_id(impl, port)`
 - Frame buffers: `rte_zmalloc_socket()`, not from mempool
-- RX frame buffers must be **zero-initialized** (partial frames have zeroed gaps, not garbage)
+- RX frame buffers must be **zero-initialized**; that covers a buffer's first use only, so a recycled buffer's un-arrived gaps must be re-zeroed before it is delivered
 - NUMA socket mismatch causes 2× DMA latency
 - DMA copies must not cross hugepage boundaries
 - Mempool names must include `recovery_idx` suffix for uniqueness across recovery cycles

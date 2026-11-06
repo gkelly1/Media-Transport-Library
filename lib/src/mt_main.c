@@ -89,43 +89,31 @@ bool mt_is_valid_socket(struct mtl_main_impl* impl, int soc_id) {
   return false;
 }
 
-static int u64_cmp(const void* a, const void* b) {
-  const uint64_t* ai = a;
-  const uint64_t* bi = b;
+/* monotonic time and the TSC midpoint of the tightest TSC-bracketed read of 3 */
+static void mt_tsc_mono_pair(uint64_t* mono, uint64_t* tsc) {
+  uint64_t best = UINT64_MAX;
 
-  if (*ai < *bi) {
-    return -1;
-  } else if (*ai > *bi) {
-    return 1;
+  for (int i = 0; i < 3; i++) {
+    uint64_t t0 = rte_get_tsc_cycles();
+    uint64_t m = mt_get_monotonic_time();
+    uint64_t t1 = rte_get_tsc_cycles();
+
+    if (t1 - t0 < best) {
+      best = t1 - t0;
+      *mono = m;
+      *tsc = t0 + best / 2;
+    }
   }
-  return 0;
 }
 
 static void* mt_calibrate_tsc(void* arg) {
   struct mtl_main_impl* impl = arg;
-  int loop = 100;
-  int trim = 10;
-  uint64_t array[loop];
-  uint64_t tsc_hz_sum = 0;
+  uint64_t start = 0, start_tsc = 0, end = 0, end_tsc = 0;
 
-  for (int i = 0; i < loop; i++) {
-    uint64_t start, start_tsc, end, end_tsc;
-
-    start = mt_get_monotonic_time();
-    start_tsc = rte_get_tsc_cycles();
-
-    mt_sleep_ms(10);
-
-    end = mt_get_monotonic_time();
-    end_tsc = rte_get_tsc_cycles();
-    array[i] = NS_PER_S * (end_tsc - start_tsc) / (end - start);
-  }
-
-  qsort(array, loop, sizeof(uint64_t), u64_cmp);
-  for (int i = trim; i < loop - trim; i++) {
-    tsc_hz_sum += array[i];
-  }
-  impl->tsc_hz = tsc_hz_sum / (loop - trim * 2);
+  mt_tsc_mono_pair(&start, &start_tsc);
+  mt_sleep_ms(MS_PER_S);
+  mt_tsc_mono_pair(&end, &end_tsc);
+  impl->tsc_hz = (double)NS_PER_S * (end_tsc - start_tsc) / (end - start);
   mt_dev_tsc_done_action(impl);
 
   info("%s, tscHz %" PRIu64 "\n", __func__, impl->tsc_hz);
@@ -273,6 +261,12 @@ static int mt_user_params_check(struct mtl_init_params* p) {
       return -EINVAL;
     }
 
+    /* only the EAL PCI devarg path carries rl_burst_size to the driver */
+    if (p->port_params[i].rl_burst_size && pmd != MTL_PMD_DPDK_USER) {
+      warn("%s(%d), rl_burst_size %u ignored on pmd type %d\n", __func__, i,
+           p->port_params[i].rl_burst_size, pmd);
+    }
+
     /* af xdp check */
     if (mtl_pmd_is_af_xdp(p->pmd[i])) {
       if (p->pmd[i] == MTL_PMD_NATIVE_AF_XDP)
@@ -382,7 +376,7 @@ static int _mt_stop(struct mtl_main_impl* impl) {
 
 mtl_handle mtl_init(struct mtl_init_params* p) {
   struct mtl_main_impl* impl = NULL;
-  int socket[MTL_PORT_MAX], ret;
+  int socket[MTL_PORT_MAX] = {0}, ret;
   int num_ports = p->num_ports;
   struct mt_kport_info kport_info;
   struct mt_interface* inf;
@@ -419,6 +413,10 @@ mtl_handle mtl_init(struct mtl_init_params* p) {
          rte_version());
 #ifdef MTL_HAS_USDT
   notice("%s, MTL_HAS_USDT is defined for this build\n", __func__);
+#endif
+#ifdef MTL_SIMULATE_PACKET_DROPS
+  /* test_anc_format.py greps libmtl.so for this string: keep it verbatim */
+  notice("%s, MTL_SIMULATE_PACKET_DROPS is defined for this build\n", __func__);
 #endif
 
   for (int i = 0; i < num_ports; i++) {
@@ -462,10 +460,6 @@ mtl_handle mtl_init(struct mtl_init_params* p) {
   }
 #endif
 
-#ifdef MTL_HAS_ASAN
-  mt_asan_init();
-#endif
-
   impl = mt_rte_zmalloc_socket(sizeof(*impl), socket[MTL_PORT_P]);
   if (!impl) {
     err("%s, impl malloc fail on socket %d\n", __func__, socket[MTL_PORT_P]);
@@ -485,12 +479,12 @@ mtl_handle mtl_init(struct mtl_init_params* p) {
 
   mt_instance_init(impl, p);
 
-  rte_memcpy(&impl->user_para, p, sizeof(*p));
+  mt_memcpy(&impl->user_para, p, sizeof(*p));
   impl->var_para.sch_default_sleep_us = 1 * US_PER_MS; /* default 1ms */
   /* use sleep zero if sleep us is smaller than this thresh */
   impl->var_para.sch_zero_sleep_threshold_us = 200;
 
-  rte_memcpy(&impl->kport_info, &kport_info, sizeof(kport_info));
+  mt_memcpy(&impl->kport_info, &kport_info, sizeof(kport_info));
   impl->type = MT_HANDLE_MAIN;
   for (int i = 0; i < num_ports; i++) {
     inf = mt_if(impl, i);
@@ -508,14 +502,14 @@ mtl_handle mtl_init(struct mtl_init_params* p) {
         goto err_exit;
       }
       /* update the sip and net mask */
-      rte_memcpy(impl->user_para.sip_addr[i], if_ip, MTL_IP_ADDR_LEN);
-      rte_memcpy(impl->user_para.netmask[i], if_netmask, MTL_IP_ADDR_LEN);
+      mt_memcpy(impl->user_para.sip_addr[i], if_ip, MTL_IP_ADDR_LEN);
+      mt_memcpy(impl->user_para.netmask[i], if_netmask, MTL_IP_ADDR_LEN);
       if (!mt_ip_to_u32(impl->user_para.gateway[i])) {
         /* try to fetch gateway */
         ret = mt_socket_get_if_gateway(if_name, if_gateway);
         if (ret >= 0) {
           info("%s(%d), get gateway succ from if\n", __func__, i);
-          rte_memcpy(impl->user_para.gateway[i], if_gateway, MTL_IP_ADDR_LEN);
+          mt_memcpy(impl->user_para.gateway[i], if_gateway, MTL_IP_ADDR_LEN);
         }
       }
     } else { /* MTL_PMD_DPDK_USER */
@@ -735,10 +729,13 @@ int mtl_bind_to_lcore(mtl_handle mt, pthread_t thread, unsigned int lcore) {
     return -EINVAL;
   }
 
-  cpu_set_t mask;
-  CPU_ZERO(&mask);
-  CPU_SET(lcore, &mask);
-  pthread_setaffinity_np(thread, sizeof(mask), &mask);
+  /* with --remap-lcore-ids the lcore id is not the cpu id, use the cpuset eal pinned */
+  cpu_set_t mask = rte_lcore_cpuset(lcore);
+  int ret = pthread_setaffinity_np(thread, sizeof(mask), &mask);
+  if (ret) {
+    err("%s, set affinity for lcore %u fail %d\n", __func__, lcore, ret);
+    return -ret;
+  }
 
   return 0;
 }
@@ -757,7 +754,7 @@ int mtl_abort(mtl_handle mt) {
 }
 
 void* mtl_memcpy(void* dest, const void* src, size_t n) {
-  return rte_memcpy(dest, src, n);
+  return mt_memcpy(dest, src, n);
 }
 
 void* mtl_hp_malloc(mtl_handle mt, size_t size, enum mtl_port port) {
@@ -1046,12 +1043,10 @@ int st_get_var_info(mtl_handle mt, struct st_var_info* info) {
   info->st22_tx_sessions_cnt = rte_atomic32_read(&impl->st22_tx_sessions_cnt);
   info->st30_tx_sessions_cnt = rte_atomic32_read(&impl->st30_tx_sessions_cnt);
   info->st40_tx_sessions_cnt = rte_atomic32_read(&impl->st40_tx_sessions_cnt);
-  info->st41_tx_sessions_cnt = rte_atomic32_read(&impl->st41_tx_sessions_cnt);
   info->st20_rx_sessions_cnt = rte_atomic32_read(&impl->st20_rx_sessions_cnt);
   info->st22_rx_sessions_cnt = rte_atomic32_read(&impl->st22_rx_sessions_cnt);
   info->st30_rx_sessions_cnt = rte_atomic32_read(&impl->st30_rx_sessions_cnt);
   info->st40_rx_sessions_cnt = rte_atomic32_read(&impl->st40_rx_sessions_cnt);
-  info->st41_rx_sessions_cnt = rte_atomic32_read(&impl->st41_rx_sessions_cnt);
 
   return 0;
 }
@@ -1059,7 +1054,7 @@ int st_get_var_info(mtl_handle mt, struct st_var_info* info) {
 int mtl_sch_enable_sleep(mtl_handle mt, int sch_idx, bool enable) {
   struct mtl_main_impl* impl = mt;
 
-  if (sch_idx > MT_MAX_SCH_NUM) {
+  if (sch_idx < 0 || sch_idx >= MT_MAX_SCH_NUM) {
     err("%s, invalid sch_idx %d\n", __func__, sch_idx);
     return -EIO;
   }
@@ -1275,9 +1270,9 @@ int mtl_port_ip_info(mtl_handle mt, enum mtl_port port, uint8_t ip[MTL_IP_ADDR_L
     return -EINVAL;
   }
 
-  if (ip) rte_memcpy(ip, mt_sip_addr(impl, port), MTL_IP_ADDR_LEN);
-  if (netmask) rte_memcpy(netmask, mt_sip_netmask(impl, port), MTL_IP_ADDR_LEN);
-  if (gateway) rte_memcpy(gateway, mt_sip_gateway(impl, port), MTL_IP_ADDR_LEN);
+  if (ip) mt_memcpy(ip, mt_sip_addr(impl, port), MTL_IP_ADDR_LEN);
+  if (netmask) mt_memcpy(netmask, mt_sip_netmask(impl, port), MTL_IP_ADDR_LEN);
+  if (gateway) mt_memcpy(gateway, mt_sip_gateway(impl, port), MTL_IP_ADDR_LEN);
   return 0;
 }
 

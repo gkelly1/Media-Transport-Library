@@ -35,6 +35,24 @@ else
   set_variable('mtl_has_xdp_backend', false)
 endif
 
+# rx video burst dispatch prefetch, see rv_handle_mbuf
+if get_option('enable_rx_video_pkt_prefetch') == true
+  add_global_arguments('-DMTL_HAS_RX_VIDEO_PKT_PREFETCH', language : 'c')
+endif
+
+# rx video frame copy with non-temporal stores, the sse2 path of rv_frame_memcpy
+if get_option('enable_rx_video_nt_store') == true
+  add_global_arguments('-DMTL_HAS_RX_VIDEO_NT_STORE', language : 'c')
+endif
+
+# Compiler hardening, see doc/build.md
+if not is_windows
+  hardening = run_command(files('../script/hardening_flags.py'), 'c', get_option('optimization'),
+    get_option('b_sanitize'), cc.cmd_array(), get_option('c_args'), check : true).stdout().split('\n')
+  add_project_arguments(hardening[0].split(), language : 'c')
+  add_project_link_arguments(hardening[1].split(), language : 'c')
+endif
+
 # usdt check
 mtl_has_usdt = false
 
@@ -60,10 +78,14 @@ if mtl_has_usdt
     output: 'mt_usdt_provider.h',
     command: [dtrace, '-C', '-h', '-s', '@INPUT@', '-o', '@OUTPUT@'],
   )
+  # dtrace compiles the object with CFLAGS from the environment only. Without
+  # -fcf-protection=full it has no .note.gnu.property, and ld drops IBT and SHSTK
+  # from libmtl.so.
   usdt_provider_object = custom_target('usdt_provider_object',
     input: usdt_provider,
     output: 'mt_usdt_provider.o',
     command: [dtrace, '-C', '-G', '-s', '@INPUT@', '-o', '@OUTPUT@'],
+    env: {'CFLAGS': hardening[0]},
     depends: usdt_provider_header,
   )
 endif
@@ -82,13 +104,12 @@ endif
 mtl_c_args = []
 mtl_link_c_args = []
 
-if not is_windows
-  mtl_link_c_args += ['-Wl,-z,now', '-Wl,-z,relro']
-endif
-
 # enable warning as error for non debug build
 if get_option('buildtype') != 'debug'
   mtl_c_args += ['-Werror']
+  # DPDK exports -march=native, and clang 18 on a Xeon 6 warns about the
+  # AVX10.1 features that implies.
+  mtl_c_args += cc.get_supported_arguments('-Wno-error=invalid-feature-combination')
 else
   # test-only TX mutation helpers (seq-gap, bad-parity, etc.) are compiled
   # into the library only for debug builds so the hot path stays clean.

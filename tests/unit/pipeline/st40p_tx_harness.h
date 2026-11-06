@@ -36,11 +36,43 @@ int ut40p_tx_init(void);
 ut40p_tx_ctx* ut40p_tx_ctx_create(int framebuff_cnt);
 void ut40p_tx_ctx_destroy(ut40p_tx_ctx* ctx);
 
+/**
+ * Turn on ST40P_TX_FLAG_BLOCK_GET behaviour: init the block cond/mutex, arm the
+ * wake_on_destroy hook, and set the blocking get_frame timeout. Call before any
+ * blocking get_frame. Mirrors the block setup st40p_tx_create() performs.
+ *
+ * timeout_ns is how long a blocking get_frame() should wait for a free frame
+ * before giving up and returning NULL.
+ */
+void ut40p_tx_ctx_enable_blocking(ut40p_tx_ctx* ctx, uint64_t timeout_ns);
+
+/**
+ * App wake (wraps st40p_tx_wake_block()). Ends a get_frame() blocked at the
+ * time of the call; a wake with no thread blocked is a no-op.
+ */
+void ut40p_tx_wake_block(ut40p_tx_ctx* ctx);
+
+/** The wake a frame done sends (wraps tx_st40p_notify_frame_available()). */
+void ut40p_tx_frame_free_wake(ut40p_tx_ctx* ctx);
+
+/**
+ * Force ctx->lc_destroying, bypassing the CAS handshake real st40p_tx_free()
+ * uses. Lets a test flip the flag mid-call to race the destroy-vs-claim
+ * window inside the blocking wait loop, without a full teardown.
+ */
+void ut40p_tx_force_destroying(ut40p_tx_ctx* ctx);
+
+/** The first two steps of st40p_tx_free(): begin_destroy, then wake_on_destroy. */
+void ut40p_tx_begin_destroy(ut40p_tx_ctx* ctx);
+
 int ut40p_tx_framebuff_cnt(const ut40p_tx_ctx* ctx);
 
 /* producer (app) side */
 struct st40_frame_info* ut40p_tx_get_frame(ut40p_tx_ctx* ctx);
 int ut40p_tx_put_frame(ut40p_tx_ctx* ctx, struct st40_frame_info* frame);
+
+/* Cancel a got frame: IN_USER -> FREE (wraps st40p_tx_put_frame_abort). */
+int ut40p_tx_put_frame_abort(ut40p_tx_ctx* ctx, struct st40_frame_info* frame);
 
 /* consumer (transport) side: returns 0 and sets *idx on success, -EBUSY when
  * no READY frame is pending. */
@@ -63,6 +95,32 @@ int ut40p_tx_all_free(const ut40p_tx_ctx* ctx);
 int ut40p_tx_frame_stat(const ut40p_tx_ctx* ctx, int i);
 
 uint64_t ut40p_tx_stat_frames_sent(const ut40p_tx_ctx* ctx);
+
+/** Register ops.notify_frame_late (and ops.priv). */
+void ut40p_tx_set_notify_frame_late(ut40p_tx_ctx* ctx,
+                                    int (*cb)(void* priv, uint64_t epoch_skipped),
+                                    void* priv);
+
+/**
+ * Run create_transport against a stub transport create, then fire the late
+ * callback it registered the way the transport session does. Returns the
+ * callback's return, or -ENOENT when no late callback was registered.
+ */
+int ut40p_tx_transport_report_late(ut40p_tx_ctx* ctx, uint64_t epoch_skipped);
+
+/** The pipeline handle, for calling the public st*p API directly. */
+st40p_tx_handle ut40p_tx_handle(ut40p_tx_ctx* ctx);
+
+/**
+ * Run tx_st40p_init_fbs() then tx_st40p_uinit_fbs() on a fresh ctx, the
+ * create-then-free (or create-failure) path. Returns the init result.
+ */
+int ut40p_tx_fbs_init_uinit(uint16_t framebuff_cnt, uint32_t max_udw_buff_size);
+
+/** Register ops.notify_frame_done (and ops.priv). */
+void ut40p_tx_set_notify_frame_done(ut40p_tx_ctx* ctx,
+                                    int (*cb)(void* priv, struct st40_frame_info* frame),
+                                    void* priv);
 
 #ifdef __cplusplus
 }

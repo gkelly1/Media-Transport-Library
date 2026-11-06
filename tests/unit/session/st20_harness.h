@@ -24,7 +24,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "mtl_api.h"
+#include "st_api.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +78,9 @@ int ut20_feed_frame_pkt(ut20_test_ctx* ctx, int pkt_idx, uint32_t ts,
  * ut20_ctx_enable_hw_timestamp(). */
 int ut20_feed_frame_pkt_hw_ts(ut20_test_ctx* ctx, int pkt_idx, uint32_t ts,
                               enum mtl_session_port port, uint64_t hw_raw_ns);
+/* Same, but leaves the RX timestamp validity flag clear, as for a stale dynfield. */
+int ut20_feed_frame_pkt_stale_hw_ts(ut20_test_ctx* ctx, int pkt_idx, uint32_t ts,
+                                    enum mtl_session_port port, uint64_t hw_raw_ns);
 
 /* Same as ut20_feed_frame_pkt() but with an explicit RTP sequence number,
  * for tests that need to drive seq independently of pkt_idx (e.g. wrap or
@@ -98,6 +101,21 @@ void ut20_ctx_enable_rtp(ut20_test_ctx* ctx);
  * ut20_ctx_enable_rtp(). */
 int ut20_feed_rtp_pkt(ut20_test_ctx* ctx, int pkt_idx, uint32_t seq, uint32_t ts,
                       enum mtl_session_port port);
+
+/* Attach the harness's 1024-byte user-meta buffer to every frame, i.e. what an
+ * app that uses the MTL user-meta extension provides. Without this the frames
+ * carry no buffer at all and every user-meta packet is refused for lack of room,
+ * which would make a length test pass for the wrong reason. */
+void ut20_ctx_enable_user_meta(ut20_test_ctx* ctx);
+
+/* Feed one MTL user-meta packet (ST20_LEN_USER_META set in row_length).
+ * `meta_len` is the length declared on the wire and `data_len` is what the
+ * mbuf actually carries, so a test can declare more meta than the packet holds
+ * — or a datagram shorter than the header, as the kernel socket path can
+ * deliver. Requires a prior ut20_ctx_enable_user_meta(). */
+int ut20_feed_user_meta_pkt(ut20_test_ctx* ctx, uint32_t seq, uint32_t ts,
+                            uint16_t meta_len, uint16_t data_len,
+                            enum mtl_session_port port);
 
 /* Feed one packet with an overridden RTP payload type (`pt`) — for negative
  * tests that assert PT validation. All other fields as ut20_feed_pkt(). */
@@ -125,7 +143,23 @@ void ut20_set_port_down(ut20_test_ctx* ctx, enum mtl_session_port port, bool dow
  * dynfield, installs an identity-mapped PTP correction, and sets
  * MT_IF_FEATURE_RX_OFFLOAD_TIMESTAMP so mt_mbuf_time_stamp() reads the
  * mbuf dynfield instead of falling back to the software PTP clock. */
+/* Enable the ST 2110-21 timing parser on the session, as the public
+ * ST20_RX_FLAG_TIMING_PARSER_META would, and optionally make the session
+ * interlaced. Returns rv_tp_init()'s status; read the per-frame verdict with the
+ * two ut20_last_tp_* accessors below. */
+int ut20_ctx_enable_timing_parser(ut20_test_ctx* ctx, bool interlaced);
+
 void ut20_ctx_enable_hw_timestamp(ut20_test_ctx* ctx, enum mtl_session_port port);
+
+/* Enable the 10 s timing-parser stat, as ST20_RX_FLAG_TIMING_PARSER_STAT would. */
+void ut20_ctx_enable_timing_parser_stat(ut20_test_ctx* ctx);
+/* Fold one frame's timing-parser result into the 10 s stat rv_tp_stat() logs.
+ * Requires a prior ut20_ctx_enable_timing_parser_stat(). */
+void ut20_tp_stat_add_frame(ut20_test_ctx* ctx, enum mtl_session_port port,
+                            int32_t vrx_min, int32_t vrx_max, int32_t ipt_min,
+                            int32_t ipt_max);
+int32_t ut20_tp_stat_vrx_max(const ut20_test_ctx* ctx, enum mtl_session_port port);
+int32_t ut20_tp_stat_ipt_max(const ut20_test_ctx* ctx, enum mtl_session_port port);
 
 /* Park a software PTP correction in the port's no_timesync_delta accumulator --
  * what a real no-timesync port (any VF) holds once PTP has synced. It must never
@@ -134,6 +168,15 @@ void ut20_ctx_set_ptp_no_timesync_delta(ut20_test_ctx* ctx, int64_t delta);
 
 /* timestamp_first_pkt captured off the most recent delivered frame's meta. */
 uint64_t ut20_last_timestamp_first_pkt(const ut20_test_ctx* ctx);
+/* Timing-parser verdict for the last delivered frame, as the app reads it from
+ * st20_rx_frame_meta.tp[]. ST_RX_TP_COMPLIANT_MAX until a frame carries one. */
+enum st_rx_tp_compliant ut20_last_tp_compliant(const ut20_test_ctx* ctx);
+const char* ut20_last_tp_failed_cause(const ut20_test_ctx* ctx);
+uint32_t ut20_last_tp_pkts_cnt(const ut20_test_ctx* ctx);
+
+/* Make every following packet look like part of an RX burst, as the RX tasklet
+ * would: successive burst count on the session, continuous-burst state on port P. */
+void ut20_ctx_set_rx_burst(ut20_test_ctx* ctx, uint16_t succ_burst_cnt, bool continuous);
 
 /* Wrapper feeders — drive the production `_handle_mbuf` wrapper instead
  * of the per-packet handler. Use these (not the direct feeders above)
@@ -148,6 +191,14 @@ int ut20_feed_pkt_via_wrapper(ut20_test_ctx* ctx, uint32_t seq, uint32_t ts,
                               uint8_t pt, uint32_t ssrc);
 int ut20_feed_frame_pkt_via_wrapper(ut20_test_ctx* ctx, int pkt_idx, uint32_t ts,
                                     enum mtl_session_port port);
+/* Feed `nb` frame packets as one burst, so the wrapper's dispatch loop runs
+ * with more than one packet in the array. The array is sized to exactly `nb`. */
+int ut20_feed_frame_burst_via_wrapper(ut20_test_ctx* ctx, const int* pkt_idx, int nb,
+                                      uint32_t ts, enum mtl_session_port port);
+/* rv_frame_memcpy() of the ctx session; `pkt_lcore` makes it a session whose
+ * frames a pkt lcore and the tasklet both write. */
+void* ut20_frame_memcpy(ut20_test_ctx* ctx, bool pkt_lcore, void* dst, const void* src,
+                        size_t n);
 
 /* Per-port counter accessors (live inside `port_user_stats.common.port[]`). */
 uint64_t ut20_stat_port_err_packets(const ut20_test_ctx* ctx, enum mtl_session_port port);
@@ -201,6 +252,22 @@ uint64_t ut20_stat_pkts_unrecovered(const ut20_test_ctx* ctx);
  * standing up an mt_stat thread. Tests assert on its real log output. */
 void ut20_invoke_rv_stat(ut20_test_ctx* ctx);
 
+/* Route payload copies through a fake DMA engine: a copy completes only after it
+ * is submitted, and never while the engine is stalled. */
+void ut20_ctx_enable_dma(ut20_test_ctx* ctx);
+void ut20_dma_set_stalled(ut20_test_ctx* ctx, bool stalled);
+/* End the current burst as the RX tasklet does (submit queued copies), then run one
+ * rv_pkt_rx_tasklet() pass, which reaps completions with no packets to receive. */
+void ut20_rx_tasklet_pass(ut20_test_ctx* ctx);
+/* copies the session handed to the DMA engine */
+uint64_t ut20_dma_copies(const ut20_test_ctx* ctx);
+/* completion polls the session made on the DMA engine */
+uint64_t ut20_dma_polls(const ut20_test_ctx* ctx);
+/* new-frame packets dropped because the previous frame's DMA did not finish */
+int ut20_dma_busy_drops(const ut20_test_ctx* ctx);
+/* new frames whose bounded flush of the previous frame's DMA timed out */
+uint64_t ut20_dma_flush_timeouts(const ut20_test_ctx* ctx);
+
 /* Number of frames the production handler has marked completed/delivered
  * since session reset. Returns the live value of `stat_frames_received`. */
 int ut20_frames_received(const ut20_test_ctx* ctx);
@@ -211,11 +278,36 @@ uint64_t ut20_stat_wrong_ssrc(const ut20_test_ctx* ctx);
 uint64_t ut20_stat_wrong_interlace(const ut20_test_ctx* ctx);
 uint64_t ut20_stat_offset_dropped(const ut20_test_ctx* ctx);
 uint64_t ut20_stat_wrong_len(const ut20_test_ctx* ctx);
+uint64_t ut20_stat_user_meta(const ut20_test_ctx* ctx);
+uint64_t ut20_stat_user_meta_err(const ut20_test_ctx* ctx);
 /* Bumped when a pkt cannot be placed in the frame: no seq base yet, or an
  * ST 2110-22 box parse failure. */
 uint64_t ut20_stat_idx_dropped(const ut20_test_ctx* ctx);
 /* Bumped once per frame whose first pkt carried accepted ST 2110-22 boxes. */
 uint64_t ut20_stat_st22_boxes(const ut20_test_ctx* ctx);
+
+/* ── external frames ──────────────────────────────────────────────────── */
+
+/* Switch to dynamic ext frames: query_ext_frame hands out a harness buffer of the
+ * session's frame size, or a NULL address when !has_addr, with `iova`. */
+void ut20_ctx_enable_query_ext_frame(ut20_test_ctx* ctx, bool has_addr, uint64_t iova);
+
+/* Give the session a DMA device with nothing in flight. The harness pkts are below
+ * the DMA copy threshold, so it is never asked to copy. */
+void ut20_ctx_attach_idle_dma(ut20_test_ctx* ctx);
+
+/* Run the production frame allocation over dedicated ext frames of `buf_len`
+ * bytes each, release them again, and return rv_alloc_frames()'s status. */
+int ut20_alloc_ext_frames(ut20_test_ctx* ctx, size_t buf_len);
+
+uint64_t ut20_stat_slot_query_ext_fail(const ut20_test_ctx* ctx);
+
+/* Run the production rv_init_sw() with ST20_RX_FLAG_DMA_OFFLOAD over dedicated
+ * ext frames, marked as GPU VRAM frames when `gpu_frames`, then rv_uinit_sw().
+ * Ext frames keep the GPU allocator out, so only the flag is under test.
+ * Returns how many DMA devices it requested, or rv_init_sw()'s error. The
+ * context cannot be fed packets afterwards. */
+int ut20_init_sw_dma_requests(ut20_test_ctx* ctx, bool gpu_frames);
 
 /* ── ST 2110-22 (codestream) mode ─────────────────────────────────────── */
 
@@ -263,10 +355,22 @@ int ut20_total_frame_pkts(void);
  * the value passed to ut20_ctx_create_geom() (or 2 for ut20_ctx_create()). */
 int ut20_pkts_per_frame(const ut20_test_ctx* ctx);
 
+/* Framebuffer size in bytes for THIS context. */
+size_t ut20_frame_size(const ut20_test_ctx* ctx);
+
+/* true while every byte the harness keeps past the declared slot bitmaps is
+ * still zero, i.e. no packet index wrote outside its bitmap. */
+bool ut20_bitmap_guard_intact(const ut20_test_ctx* ctx);
+
 /* Drive the production detach-time flush of any slot still holding a deferred
  * per-port deficit (test-only). Exercises `rv_flush_pending_loss`, the path the
  * production `rv_detach` runs before its final stat dump. */
 void ut20_session_detach(ut20_test_ctx* ctx);
+
+/* rv_ops_check() / rv_st22_ops_check() on valid two-port RTP-level ops with the IPs of
+ * `src`. */
+int ut20_ops_check_source(const struct st_rx_source_info* src);
+int ut20_st22_ops_check_source(const struct st_rx_source_info* src);
 
 #ifdef __cplusplus
 }

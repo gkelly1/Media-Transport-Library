@@ -7,28 +7,31 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import time
+import zlib
 from typing import Any, Dict
 
 import pytest
 from common.collect_platform_info import collect_platform_info
-from common.host_setup import ensure_hugepage_access, ensure_pf_up
+from common.host_setup import check_hugepages, ensure_pf_up
 from common.mtl_manager.mtlManager import MtlManager
 from common.nicctl import InterfaceSetup, Nicctl
-from create_pcap_file.netsniff import NetsniffRecorder, calculate_packets_per_frame
+from create_pcap_file.netsniff import (
+    DROP_AFTER_TAP_PREF,
+    NetsniffRecorder,
+    calculate_packets_per_frame,
+)
 from mfd_common_libs.custom_logger import add_logging_level
 from mfd_common_libs.log_levels import TEST_FAIL, TEST_INFO, TEST_PASS
 from mfd_connect.exceptions import ConnectionCalledProcessError
 from mtl_engine import ip_pools
 from mtl_engine.const import (
-    DPDK_LIB_PATH,
-    FFMPEG_LIB_PATH,
     FFMPEG_PATH,
     FRAMES_CAPTURE,
-    GSTREAMER_LIB_PATH,
+    ISOLATE_SH,
     LOG_FOLDER,
-    MTL_LIB_PATH,
     NIC_FAMILY_BY_DEVICE_ID,
     PERF_LOG_FOLDER,
     RXTXAPP_PATH,
@@ -38,8 +41,13 @@ from mtl_engine.const import (
 from mtl_engine.csv_report import csv_add_test, csv_write_report, get_compliance_result
 from mtl_engine.execute import kill_stale_processes
 from mtl_engine.ffmpeg import FFmpeg
+from mtl_engine.gstreamer import GStreamer
 from mtl_engine.integrity_session import IntegritySession
-from mtl_engine.pcap_compliance import NO_COMPLIANCE, ComplianceSession
+from mtl_engine.pcap_compliance import (
+    NO_COMPLIANCE,
+    ComplianceSession,
+    unparsable_reason,
+)
 from mtl_engine.ramdisk import Ramdisk
 from mtl_engine.rxtxapp import RxTxApp
 from mtl_engine.stash import (
@@ -381,10 +389,9 @@ _PHC_SYNC_TIMEOUT_SEC = 30  # Max wait for phc2sys to converge before capturing
 def _reap_ptp_daemons(host, *, patterns=("phc2sys", "ptp4l")) -> None:
     """Forcefully kill any ptp4l/phc2sys daemons.
 
-    Required because ``host.connection.start_process('sudo <tool> ...')`` wraps
-    the daemon in ``bash -c 'sudo ...'``; ``process.kill(SIGTERM)`` only signals
-    the bash wrapper, sudo does NOT propagate signals to its child, and the
-    actual daemon (root) reparents to PID 1 and persists. Leaked daemons hold
+    Required because the pid of ``host.connection.start_process('sudo <tool> ...')``
+    is the root ``sudo``: when the SSH user is not root, ``process.kill()`` fails
+    with EPERM and raises, and the daemon persists. Leaked daemons hold
     stale ``struct ptp_clock *`` across SR-IOV VF cycling and have been seen to
     trigger ``ice``-driver use-after-free in ``ptp_clock_index()``, hanging the
     host. Always cleanup via ``pkill`` on the argv, not via the process handle.
@@ -407,25 +414,35 @@ def _reap_ptp_daemons(host, *, patterns=("phc2sys", "ptp4l")) -> None:
 
 
 def _host_tai_utc_offset(host) -> int:
-    """Return the host's current TAI-UTC offset in seconds (e.g. 37).
+    """Return the host's current TAI-UTC offset in seconds (0 or e.g. 37).
 
-    ST 2110 media (RTP) timestamps are on the PTP/TAI timescale, while the
-    Linux system clock (``CLOCK_REALTIME``) is UTC -- the two differ by the
-    accumulated leap seconds. The kernel exposes the live offset as
-    ``CLOCK_TAI - CLOCK_REALTIME``; we read it on the capture host so the value
-    stays correct across future leap seconds instead of hard-coding 37.
+    The transmitters time their RTP timestamps off ``CLOCK_TAI`` (RxTxApp via
+    ``app_platform.h``, FFmpeg via the plugin's ``ptp_get_time_fn``), which the
+    kernel derives from ``CLOCK_REALTIME`` plus this offset. Reading the live
+    value is what puts the capture PHC on the transmitter's clock, so whatever
+    the host reports is the right answer -- including 0, which simply means
+    both ends sit on UTC. Never impose an offset instead: it is host-wide
+    state, and moving it would step the media clock of any session already
+    streaming.
+
+    ``host`` is the capture host, so this holds while the transmitter runs
+    there too -- every ``tests/single/`` case, and so every capture CI takes.
+    A dual-host capture would have to read the offset on the sending host.
     """
     cmd = (
         "python3 -c 'import time;"
         "print(round(time.clock_gettime(time.CLOCK_TAI)"
         "-time.clock_gettime(time.CLOCK_REALTIME)))'"
     )
-    try:
-        out = host.connection.execute_command(cmd, expected_return_codes=None).stdout
-        return int((out or "0").strip())
-    except Exception as e:
-        logger.warning("Could not read TAI-UTC offset on %s: %s", host.name, e)
-        return 0
+    out = host.connection.execute_command(cmd, expected_return_codes={0}).stdout
+    text = (out or "").strip()
+    if not text:
+        # Never fall back to 0: it is a legitimate offset, so a silent default
+        # would be indistinguishable from a host that really reports 0.
+        raise RuntimeError(
+            f"Reading the TAI-UTC offset on {host.name} produced no output: {cmd}"
+        )
+    return int(text)
 
 
 def _start_capture_phc_sync(host, iface: str):
@@ -434,34 +451,24 @@ def _start_capture_phc_sync(host, iface: str):
     ST 2110-21 compliance needs hardware (on-wire) capture timestamps so RX
     interrupt coalescing cannot smear packet spacing. Those timestamps come
     from the NIC PHC, which free-runs -- its absolute offset from the RTP media
-    epoch makes ST 2110-21 VRX fail. The RTP media clock is TAI, so we discipline
-    the PHC onto TAI: ``phc2sys -s CLOCK_REALTIME`` tracks the system clock (UTC)
-    and ``-O <tai_utc_offset>`` adds the leap-second offset so the PHC lands on
-    TAI. The wall clock is the source and is never adjusted.
+    epoch makes ST 2110-21 VRX fail. The transmitters read ``CLOCK_TAI``, so we
+    discipline the PHC onto that same clock: ``phc2sys -s CLOCK_REALTIME`` tracks
+    the system clock (UTC) and ``-O <tai_utc_offset>`` adds the host's live
+    TAI-UTC offset, reproducing ``CLOCK_TAI`` on the PHC. The wall clock is the
+    source and is never adjusted.
 
     The function blocks until the PHC has actually converged onto TAI --
     starting the capture while phc2sys is still slewing a tens-of-ms offset
     makes ST 2110-21 VRX fail even with flawless on-wire pacing.
 
-    Returns the process handle (or ``None`` if it failed to start). Always reap
-    via :func:`_reap_ptp_daemons`, never via the handle (sudo+bash wrapper).
+    Returns the process handle or raises if synchronization fails. Always reap
+    via :func:`_reap_ptp_daemons`, never via the handle (its pid is the root sudo).
     """
     # Clear any straggler before starting a fresh one.
     _reap_ptp_daemons(host, patterns=("phc2sys",))
     log_path = f"/tmp/phc2sys-{iface}.log"
-    # phc2sys ``-O`` drives the slave (PHC) to ``master + O``; with the system
-    # clock (UTC) as master this lands the PHC on TAI = UTC + tai_utc_offset.
+    # phc2sys ``-O`` drives the slave (PHC) to ``master + O``.
     tai_utc_offset = _host_tai_utc_offset(host)
-    if tai_utc_offset == 0:
-        # A genuine 0 (kernel TAI offset never set by a PTP stack) parks the PHC
-        # on UTC -- exactly the 37s timescale error this discipline removes --
-        # so the absolute-offset (VRX) check would silently regress.
-        logger.warning(
-            "TAI-UTC offset reads 0 on %s; capture PHC will be disciplined to "
-            "UTC and ST 2110-21 VRX may fail. Set the kernel TAI offset "
-            "(ptp4l/adjtimex) on the capture host.",
-            host.name,
-        )
     # ``-S 0.001`` steps the (free-running) PHC straight onto TAI when the
     # initial offset exceeds 1ms instead of slewing for tens of seconds;
     # once synced the offset stays sub-microsecond so no further steps occur.
@@ -475,28 +482,21 @@ def _start_capture_phc_sync(host, iface: str):
             cmd, stderr_to_stdout=True, output_file=log_path
         )
     except Exception as e:
-        logger.warning("Failed to start phc2sys on %s: %s", iface, e)
-        return None
+        _reap_ptp_daemons(host, patterns=("phc2sys",))
+        raise RuntimeError(f"Failed to start phc2sys on {iface}: {e}") from e
     time.sleep(0.2)  # fail fast (e.g. iface has no PHC)
     if not proc.running:
-        logger.warning(
-            "phc2sys exited immediately (iface=%s has no PHC?). log=%s",
-            iface,
-            log_path,
-        )
         _reap_ptp_daemons(host, patterns=("phc2sys",))
-        return None
+        raise RuntimeError(f"phc2sys exited on {iface}; inspect {log_path}")
     # Wait for the PHC to actually converge. Capturing before convergence leaves
     # a large fixed PHC<->TAI offset (a free-running PHC can be tens of ms off
     # the media clock); that offset fails ST 2110-21 VRX even with perfect
     # on-wire pacing.
-    if not _wait_phc_sync_converged(host, log_path):
-        logger.warning(
-            "phc2sys did not converge within %ss on %s; capture timestamps may "
-            "carry a clock offset. log=%s",
-            _PHC_SYNC_TIMEOUT_SEC,
-            iface,
-            log_path,
+    if not _wait_phc_sync_converged(host, log_path) or not proc.running:
+        _reap_ptp_daemons(host, patterns=("phc2sys",))
+        raise RuntimeError(
+            f"phc2sys did not hold sync on {iface} (no in-tolerance offset "
+            f"within {_PHC_SYNC_TIMEOUT_SEC}s, or it exited); inspect {log_path}"
         )
     return proc
 
@@ -543,7 +543,7 @@ def reap_leaked_phc_daemons(hosts):
 
 @pytest.fixture(scope="function")
 def ptp_sync(request, test_config: dict, hosts):
-    """Start ptp4l only for tests marked ``@pytest.mark.ptp``.
+    """Keep every external PTP daemon off the PHC for ``@pytest.mark.ptp`` tests.
 
     Historical design ran phc2sys for every pcap-capturing test, which
     multiplied the sudo+kill leak (see _reap_ptp_daemons) into 8+ daemons in
@@ -552,9 +552,15 @@ def ptp_sync(request, test_config: dict, hosts):
     corrupt systemd-journald. We now:
 
     * early-return for non-@pytest.mark.ptp tests (no daemon at all);
-    * for @pytest.mark.ptp tests, run ptp4l only -- NOT phc2sys (keep wall
-      clock untouched, pcap uses CLOCK_REALTIME which is fine for ptp4l's
-      own assertions);
+    * for @pytest.mark.ptp tests, run no daemon either -- MTL's internal PTP
+      owns the NIC PHC here: it seeds it in ``dev_start_timesync()`` and then
+      steers it with ``rte_eth_timesync_adjust_time()``. Both ports of an E810
+      share one PHC, so a ptp4l slaving the capture port steers the very clock
+      MTL is steering. Two servos each apply the full grandmaster correction and
+      the capture ends up one whole offset away from the timescale MTL stamps
+      RTP with, which is what ``packet_ts_vs_rtp_ts`` then reports. Leaving the
+      PHC to MTL puts the pcap and the RTP timestamps on one clock by
+      construction -- see also the phc2sys skip in :func:`pcap_capture`;
     * cleanup via ``sudo pkill`` on the argv, never via the process handle.
     """
     if not request.node.get_closest_marker("ptp"):
@@ -572,26 +578,12 @@ def ptp_sync(request, test_config: dict, hosts):
         host, capture_cfg, single_host=is_single_host
     )
 
-    # Belt-and-braces: ensure no leftover daemon from a previous test/session
-    # is holding a stale PHC handle before we start a new one.
+    # A daemon leaked by a previous test/session would steer the PHC against
+    # MTL for the whole run, so clear the field and hand the clock to MTL.
     _reap_ptp_daemons(host)
-
-    logger.info(f"Starting ptp4l for PTP synchronization (iface={capture_iface})")
-    log_path = f"/tmp/ptp4l-{capture_iface}.log"
-    ptp4l_cmd = f"sudo ptp4l -i '{capture_iface}' -s -m -2"
-    ptp4l_process = host.connection.start_process(
-        ptp4l_cmd,
-        stderr_to_stdout=True,
-        output_file=log_path,
+    logger.info(
+        f"@pytest.mark.ptp: leaving the {capture_iface} PHC to MTL's internal PTP"
     )
-
-    # Give ptp4l a moment to fail fast (e.g., missing interface).
-    time.sleep(0.2)
-    if not ptp4l_process.running:
-        _reap_ptp_daemons(host)
-        raise RuntimeError(
-            f"Failed to start ptp4l (iface={capture_iface}). log={log_path}"
-        )
 
     try:
         yield
@@ -722,7 +714,28 @@ def _capability_gate(request, nic_family):
 
 
 @pytest.fixture(scope="session")
-def nic_port_list(hosts: dict, mtl_path, test_config) -> None:
+def host_dma_devices(hosts: dict, mtl_path) -> None:
+    """Best-effort: bind a DMA channel on each host's primary port NUMA node
+    and store it as host.dma_device (None on a host that serves none -- an
+    optional accelerator, not a setup requirement).
+
+    Session scope so pytest runs it before any function-scoped
+    setup_interfaces binds a VF or PF to vfio-pci, and nic_port_list
+    depends on it for the same reason: on a host's first call,
+    Nicctl.bind_dma()'s one-time vfio_pci reload (to lift Intel DSA's
+    denylist) detaches every device already bound to it, DSA or not.
+
+    Kept apart from nic_port_list so tests that never use a session VF pool
+    (single-host setup_interfaces tests, NICs without SR-IOV such as i225)
+    get the DMA default without also running VF setup.
+    """
+    for host in hosts.values():
+        nicctl = Nicctl(get_host_mtl_path(host, default=mtl_path), host)
+        host.dma_device = nicctl.bind_dma(host.network_interfaces[0].pci_address.lspci)
+
+
+@pytest.fixture(scope="session")
+def nic_port_list(hosts: dict, mtl_path, test_config, host_dma_devices) -> None:
     # Default session-pool size. Tests rarely need more than 6 VFs at once;
     # we cap at the PF's ``sriov_totalvfs`` so a host that exposes only 2
     # VFs per PF still gets a pool of 2 (instead of nicctl creating 2 and
@@ -745,7 +758,7 @@ def nic_port_list(hosts: dict, mtl_path, test_config) -> None:
             return DEFAULT_POOL_SIZE
 
     for host in hosts.values():
-        ensure_hugepage_access(host)
+        check_hugepages(host)
 
         # Use per-host MTL path from topology extra_info, fall back to
         # the global mtl_path fixture.
@@ -837,6 +850,12 @@ def num_sessions(request) -> int | None:
 def sch_quota(request) -> int | None:
     """Return the --sch_quota value (scheduler session quota override) or None."""
     return request.config.getoption("--sch_quota", default=None)
+
+
+@pytest.fixture(scope="session")
+def sut_app_args(request) -> str | None:
+    """Return the --sut_app_args value, shell-quoted per token, or None."""
+    return request.config.getoption("--sut_app_args", default=None)
 
 
 @pytest.fixture(autouse=True)
@@ -1022,13 +1041,16 @@ def media_file(media_ramdisk, request, hosts, test_config, output_files):
         # Per-host media_path from topology extra_info, fall back to test_config
         media_path = get_host_media_path(host, default=default_media_path)
         src_media_file_path = os.path.join(media_path, media_file_info["filename"])
-        # Probe source existence first so missing assets become SKIPPED rather
-        # than ERROR — they are environment/data issues, not test logic bugs.
+        # A missing asset fails the case's setup (ERROR), never skips it: a skip
+        # goes unnoticed, and hid 105 nightly cases for weeks.
         probe = host.connection.execute_command(
             f"test -f {src_media_file_path}", expected_return_codes=None
         )
         if probe.return_code != 0:
-            pytest.skip(f"Media file not present on {host}: {src_media_file_path}")
+            pytest.fail(
+                f"Media file not present on {host}: {src_media_file_path}",
+                pytrace=False,
+            )
         cmd = f"sudo cp {src_media_file_path} {ramdisk_media_file_path}"
         try:
             host.connection.execute_command(cmd)
@@ -1061,6 +1083,14 @@ def mtl_manager(hosts):
         mgr.stop()
 
 
+def _shard(value):
+    """Parse ``K/N`` into the 1-based shard ``K`` of ``N``."""
+    index, total = map(int, value.split("/"))
+    if not 0 < index <= total:
+        raise ValueError(value)
+    return index, total
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--keep", help="keep result media files: all, failed, none (default)"
@@ -1089,6 +1119,20 @@ def pytest_addoption(parser):
         help="Override the scheduler session quota (sessions per scheduler). "
         "Lower quota = more cores; higher quota = fewer cores. "
         "Use 60 for minimal cores. Example: --sch_quota 60",
+    )
+    parser.addoption(
+        "--sut_app_args",
+        default=None,
+        # Quoted per token: the arguments reach a remote shell.
+        type=lambda args: shlex.join(shlex.split(args)),
+        help="Extra RxTxApp arguments for the measured app of a performance "
+        "sweep. Example: --sut_app_args='--nb_rx_desc 1024 --rx_pool_data_size 1300'",
+    )
+    parser.addoption(
+        "--shard",
+        type=_shard,
+        help="run only shard K of N of the selected tests, e.g. 2/4; the N "
+        "shards together run every test once",
     )
 
 
@@ -1191,8 +1235,10 @@ def pcap_capture(
     """
     capture_cfg = test_config.get("capture_cfg", {}) or {}
     session = NO_COMPLIANCE
+    sync_phc = False
     phc_sync_active = False
     phc_sync_host = None
+    yielded = False
     # Compliance is REQUIRED by default for any test that requests this
     # fixture -- capture_cfg.enable absent or true both mean "on". The only
     # way to opt out via config is an explicit `capture_cfg.enable: false` (a
@@ -1200,21 +1246,16 @@ def pcap_capture(
     # opt out at runtime via ``pcap_capture.skip(reason)``.
     capture_disabled = capture_cfg.get("enable") is False
 
-    # EBU pcap compliance analyser does not support 8K resolution
-    is_8k = False
-    if media_file:
-        media_file_info, _ = media_file
-        if media_file_info and (
-            media_file_info.get("height", 0) >= 4320
-            or media_file_info.get("width", 0) >= 7680
-        ):
-            is_8k = True
-            logger.info(
-                "8K resolution detected. Disabling PCAP capture and compliance check as EBU compliance "
-                "analyser does not support 8K."
-            )
+    # Media the EBU LIST analyser cannot judge: there is no verdict to read, so
+    # recording the capture is pointless too. mtl_engine.pcap_compliance is the
+    # single place these exclusions and their reasons live -- a test that sends
+    # other media than its media_file reaches the same list through
+    # pcap_capture.skip(unparsable_reason(...)), as test_st20p_fps does.
+    unparsable = unparsable_reason(media_file[0] if media_file else None)
+    if unparsable:
+        logger.info("Disabling PCAP capture and compliance check: %s", unparsable)
 
-    skip_capture = capture_disabled or is_8k
+    skip_capture = capture_disabled or bool(unparsable)
     if not skip_capture:
         host = _select_capture_host(hosts)
         is_single_host = len(hosts) == 1
@@ -1266,15 +1307,20 @@ def pcap_capture(
         # clock for the absolute-offset check. Skip when MTL itself paces from
         # the NIC PHC (Remedy B: set capture_cfg.phc_sync=false alongside
         # enable_ptp), because then the PHC is the shared reference, not wall
-        # time.  Also skip for @pytest.mark.ptp tests: ptp_sync already runs
-        # ptp4l on this PHC, so a second daemon (phc2sys) would fight it for the
-        # clock.
+        # time.  Also skip for @pytest.mark.ptp tests, for the same reason: MTL's
+        # internal PTP owns this PHC there, and phc2sys steering it towards the
+        # system clock would leave the pcap on a different timescale from the RTP
+        # timestamps -- see :func:`ptp_sync`.
         ptp_marked = request.node.get_closest_marker("ptp") is not None
-        if capture_cfg.get("phc_sync", True) and not ptp_marked:
-            if _start_capture_phc_sync(host, capture_iface) is not None:
-                phc_sync_active = True
-                phc_sync_host = host
+        sync_phc = capture_cfg.get("phc_sync", True) and not ptp_marked
     try:
+        if sync_phc:
+            # This raises when the PHC will not discipline, and it runs inside
+            # the try so that teardown still closes the session already built.
+            _start_capture_phc_sync(host, capture_iface)
+            phc_sync_active = True
+            phc_sync_host = host
+        yielded = True
         yield session
     finally:
         if phc_sync_active and phc_sync_host is not None:
@@ -1286,7 +1332,12 @@ def pcap_capture(
         # only catches a test that requested the fixture but never dispatched
         # it at all. A test that already failed never got that far, so
         # enforcing there would only bury the real failure.
-        session.close(enforce_dispatch=not _phase_incomplete(request))
+        #
+        # `yielded` is the same rule for a raise *before* the yield: that
+        # unwinds this generator inline, before pytest builds a setup report,
+        # so _phase_incomplete() sees an empty stash and cannot tell that the
+        # fixture itself failed.
+        session.close(enforce_dispatch=yielded and not _phase_incomplete(request))
 
 
 @pytest.fixture(scope="function")
@@ -1333,7 +1384,6 @@ def log_case(request, caplog: pytest.LogCaptureFixture):
 
     def fail_test(stage):
         logger.log(level=TEST_FAIL, msg=f"{stage} failed for {case_id}")
-        os.chmod(logfile, 0o4755)
         return "Fail"
 
     if report["setup"].failed:
@@ -1348,7 +1398,6 @@ def log_case(request, caplog: pytest.LogCaptureFixture):
             result = fail_test("Compliance")
         else:
             logger.log(level=TEST_PASS, msg=f"Test passed for {case_id}")
-            os.chmod(logfile, 0o755)
             result = "Pass"
     else:
         logger.log(level=TEST_INFO, msg=f"Test skipped for {case_id}")
@@ -1378,7 +1427,7 @@ def init_ip_address_pools(test_config: dict[Any, Any]) -> None:
     ip_pools.init(session_id=session_id)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(params=["rxtxapp"])
 def application() -> RxTxApp:
     """Application handle used by refactored tests.
 
@@ -1386,6 +1435,10 @@ def application() -> RxTxApp:
     deliberately application-agnostic so individual test modules can later
     parametrise over alternative framework adapters (FFmpeg, GStreamer)
     without churning every signature.
+
+    The param puts ``|application = rxtxapp|`` in the test id, which the
+    nightly report groups results by. It is function-scoped because a
+    session-scoped param makes pytest regroup tests across modules.
     """
     return RxTxApp(RXTXAPP_PATH)
 
@@ -1396,12 +1449,28 @@ def ffmpeg_app() -> FFmpeg:
     return FFmpeg(FFMPEG_PATH)
 
 
-def pytest_collection_modifyitems(items):
-    """Add ``base_performance`` marker to 1080p / 59fps combinations."""
+def pytest_collection_modifyitems(config, items):
+    """Add ``base_performance`` marker to 1080p / 59fps combinations.
+
+    With ``--shard``, also deselect the tests of the other shards.
+    """
     mark = pytest.mark.base_performance
     for item in items:
         if "1080p" in item.nodeid and "59fps" in item.nodeid:
             item.add_marker(mark)
+    shard = config.getoption("--shard")
+    if shard:
+        index, total = shard
+        kept, deselected = [], []
+        for item in items:
+            # crc32, not hash(): str hashes differ per process, and the shards
+            # of a run must agree on where each test goes.
+            if zlib.crc32(item.nodeid.encode()) % total == index - 1:
+                kept.append(item)
+            else:
+                deselected.append(item)
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = kept
 
 
 # ---------------------------------------------------------------------------
@@ -1416,8 +1485,12 @@ def pytest_collection_modifyitems(items):
 # hermetic without killing any test on timeout.
 
 
-def _reset_host_state(host) -> None:
-    """Best-effort cleanup of MTL leftovers on a single host. Never raises."""
+def _reset_host_state(host, mtl_path: str) -> None:
+    """Best-effort cleanup of MTL leftovers on a single host.
+
+    Raises when isolate.sh --sweep cannot run or fails, unless sudo itself
+    refuses: a CPU partition left behind would skew every later test.
+    """
     try:
         kill_stale_processes(host)
     except Exception as e:  # pragma: no cover — best-effort
@@ -1431,10 +1504,41 @@ def _reset_host_state(host) -> None:
         )
     except Exception as e:  # pragma: no cover
         logger.debug("hugepage cleanup failed: %s", e)
+    # Capture drop rules a killed session left (NetsniffRecorder._drop_after_tap).
+    try:
+        sweep_drops = [
+            f"sudo tc filter del dev {nic.name} ingress pref {DROP_AFTER_TAP_PREF} 2>/dev/null"
+            for nic in host.network_interfaces
+        ]
+        host.connection.execute_command(
+            "; ".join(sweep_drops + ["true"]),
+            shell=True,
+            timeout=10,
+            expected_return_codes=None,
+        )
+    except Exception as e:  # pragma: no cover
+        logger.debug("capture drop rule cleanup failed: %s", e)
+    res = host.connection.execute_command(
+        f"sudo -n {mtl_path}/{ISOLATE_SH} --sweep",
+        shell=True,
+        timeout=30,
+        stderr_to_stdout=True,
+        expected_return_codes=None,
+    )
+    output = (res.stdout or "").strip()
+    if res.return_code == 0:
+        if output:
+            logger.info("isolate.sh --sweep on %s:\n%s", host.name, output)
+    elif "isolate.sh: ERROR" not in output and output.startswith("sudo:"):
+        logger.warning("isolate.sh --sweep not run on %s: %s", host.name, output)
+    else:
+        raise RuntimeError(
+            f"isolate.sh --sweep failed on {host.name} (rc {res.return_code}): {output}"
+        )
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _ensure_clean_hw_state(hosts):
+def _ensure_clean_hw_state(hosts, mtl_path):
     """Guarantee a clean hardware state at session start and end.
 
     Runs before any test: kills stray RxTxApp/gtest processes that may
@@ -1442,87 +1546,44 @@ def _ensure_clean_hw_state(hosts):
     wipes stale DPDK hugepage mappings. The next session's start hook will
     repeat the work, so we deliberately do **not** run it again at session
     teardown — that just adds wall-clock for no observable benefit. Errors
-    are logged but never propagated.
+    are logged but never propagated, except a failing isolate.sh sweep.
     """
     for host in hosts.values():
-        _reset_host_state(host)
-    yield
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _register_local_libs(hosts, mtl_path):
-    """Register .local_install libraries via ldconfig so LD_LIBRARY_PATH is unnecessary."""
-    # Some *_LIB_PATH constants are colon-separated (LD_LIBRARY_PATH style).
-    # ld.so.conf requires one directory per line, so split on ':' first.
-    raw_paths = [MTL_LIB_PATH, DPDK_LIB_PATH, FFMPEG_LIB_PATH, GSTREAMER_LIB_PATH]
-    lib_dirs = []
-    for p in raw_paths:
-        for part in p.split(":"):
-            lib_dirs.append(os.path.join(mtl_path, part.removeprefix("./")))
-
-    # Also register the st22 plugin trees, wherever each component's install
-    # layout put its shared objects (lib, lib64, lib/x86_64-linux-gnu). Without
-    # the jpegxs tree, ldconfig -p never lists
-    # libst_plugin_st22_svt_jpeg_xs.so and every JPEG XS test fails the
-    # require_encoder() pre-flight check (mtl_plugin_check_cmd) before it sends
-    # a packet.
-    for component in (".local_install/plugins", ".local_install/jpegxs"):
-        base = os.path.join(mtl_path, component)
-        if not os.path.isdir(base):
-            continue
-        for root, dirs, files in os.walk(base):
-            if any(f.endswith(".so") for f in files):
-                lib_dirs.append(root)
-
-    conf = "\\n".join(lib_dirs)
-    ffmpeg_bin = os.path.join(mtl_path, FFMPEG_PATH.removeprefix("./"))
-    # /usr/local/lib precedes /etc/ld.so.conf.d/* in /etc/ld.so.conf, so any
-    # stale libav*/libsw*/libpostproc* there shadows the .local_install build.
-    # Every write below lands outside the SSH user's home, and that user is not
-    # necessarily root -- a fleet runner logs in as an ordinary account with
-    # passwordless sudo, which is what every other privileged step in this file
-    # assumes. Without sudo the whole chain fails on the first redirection and
-    # the tests inherit a linker cache that knows nothing about
-    # .local_install.
-    purge = (
-        "sudo mkdir -p /var/backups/mtl_libav_shadow && "
-        "sudo mv -f /usr/local/lib/libav*.so* /usr/local/lib/libsw*.so* "
-        "/usr/local/lib/libpostproc*.so* /usr/local/lib/x86_64-linux-gnu/libst_plugin_st22_avcodec.so* "
-        "/usr/local/lib64/libst_plugin_st22_avcodec.so* "
-        "/usr/local/lib/libst_plugin_st22_avcodec.so* /var/backups/mtl_libav_shadow/ "
-        "2>/dev/null; true"
-    )
-    for host in hosts.values():
-        try:
-            host.connection.execute_command(
-                f"{purge} && printf '{conf}\\n' | sudo tee /etc/ld.so.conf.d/mtl_local.conf"
-                f" > /dev/null && sudo ldconfig"
-                f" && sudo ln -sf {ffmpeg_bin}/ffprobe /usr/local/bin/ffprobe"
-                f" && sudo ln -sf {ffmpeg_bin}/ffmpeg /usr/local/bin/ffmpeg",
-                shell=True,
-                timeout=15,
-            )
-        except Exception as e:
-            logger.warning("ldconfig registration failed on %s: %s", host.name, e)
+        _reset_host_state(host, get_host_mtl_path(host, default=mtl_path))
     yield
 
 
 @pytest.fixture(scope="session")
-def app_factory(mtl_path):
+def app_factory(mtl_path, hosts, host_dma_devices):
     """Return a factory that creates framework adapter instances.
 
     Usage: app = app_factory("ffmpeg") or app = app_factory("rxtxapp")
     """
+    # host_dma_devices sets host.dma_device; depending on it guarantees that
+    # already happened. Single-host only: every app this factory returns gets
+    # host #1's dma_dev, wrong for a future dual-host DMA test's rx_app --
+    # none exists yet to need per-host values.
+    host = list(hosts.values())[0]
+    dma_dev = getattr(host, "dma_device", None)
 
     def factory(application: str):
         if application == "rxtxapp":
-            return RxTxApp(
+            app = RxTxApp(
                 app_path=os.path.join(mtl_path, RXTXAPP_PATH.removeprefix("./"))
             )
+            app._default_dma_dev = dma_dev
+            return app
         elif application == "ffmpeg":
-            return FFmpeg(
+            app = FFmpeg(
                 app_path=os.path.join(mtl_path, FFMPEG_PATH.removeprefix("./"))
             )
+            app._default_dma_dev = dma_dev
+            return app
+        elif application == "gstreamer":
+            # gst-launch-1.0 is the system binary; only the plugin is in-tree.
+            app = GStreamer()
+            app._default_dma_dev = dma_dev
+            return app
         else:
             raise ValueError(f"Unknown application: {application}")
 

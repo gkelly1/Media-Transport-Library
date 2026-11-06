@@ -4,8 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Ubuntu 22.04 — no eBPF/XDP (unsupported with DPDK >= 26.03 on Ubuntu 22)
-ARG IMAGE_CACHE_REGISTRY=docker.io
-FROM "${IMAGE_CACHE_REGISTRY}/library/ubuntu:22.04@sha256:149d67e29f765f4db62aa52161009e99e389544e25a8f43c8c89d4a445a7ca37" AS builder
+FROM ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 AS builder
 
 LABEL maintainer="andrzej.wilczynski@intel.com,dawid.wesierski@intel.com,marek.kasiewicz@intel.com"
 
@@ -23,7 +22,7 @@ RUN apt-get update -y && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         ca-certificates sudo curl unzip wget \
-        apt-transport-https apt-utils python3-dev \
+        apt-transport-https apt-utils python3-dev python3-pip \
         git build-essential python3-pyelftools pkg-config \
         libnuma-dev libjson-c-dev libpcap-dev libgtest-dev \
         libsdl2-dev libsdl2-ttf-dev libssl-dev systemtap-sdt-dev \
@@ -31,7 +30,6 @@ RUN apt-get update -y && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
-    curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3 && \
     python3 -m pip --no-cache-dir install --upgrade pip setuptools meson ninja
 
 COPY . "${MTL_REPO}"
@@ -40,17 +38,16 @@ COPY . "${MTL_REPO}"
 WORKDIR "${MTL_REPO}/script"
 RUN ./build_dpdk.sh -f
 
-# Build MTL
+# Run the unit suite, then build MTL
 WORKDIR "${MTL_REPO}"
-RUN ./build.sh && \
+RUN ./build.sh unit && \
+    ./build.sh && \
     ninja -C build install && \
     DESTDIR=/install ninja -C build install && \
     setcap 'cap_net_raw+ep' tests/tools/RxTxApp/build/RxTxApp
 
 # Ubuntu 22.04, runtime/final stage
-ARG MTL_REPO
-ARG IMAGE_CACHE_REGISTRY
-FROM "${IMAGE_CACHE_REGISTRY}/library/ubuntu:22.04@sha256:149d67e29f765f4db62aa52161009e99e389544e25a8f43c8c89d4a445a7ca37" AS final
+FROM ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 AS final
 
 LABEL org.opencontainers.image.authors="andrzej.wilczynski@intel.com,dawid.wesierski@intel.com,marek.kasiewicz@intel.com"
 LABEL org.opencontainers.image.url="https://github.com/OpenVisualCloud/Media-Transport-Library"
@@ -71,8 +68,9 @@ SHELL ["/bin/bash", "-ex", "-o", "pipefail", "-c"]
 WORKDIR /home/imtl/
 RUN apt-get clean -y && rm -rf /var/lib/apt/lists/* && \
     apt-get update -y && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends ca-certificates sudo curl unzip && \
-    apt-get install -y --no-install-recommends libnuma1 libjson-c5 libpcap0.8 libsdl2-2.0-0 libsdl2-ttf-2.0-0 libssl3 libatomic1 && \
+    apt-get install -y --no-install-recommends libnuma1 libjson-c5 libpcap0.8 libsdl2-2.0-0 libsdl2-ttf-2.0-0 libssl3 libatomic1 pciutils && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
@@ -81,10 +79,13 @@ RUN apt-get clean -y && rm -rf /var/lib/apt/lists/* && \
     useradd -m -G vfio,root,sudo -u 20001 imtl
 
 # Copy libraries and binaries
+COPY --from=builder /usr/local/lib/x86_64-linux-gnu/* /usr/local/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/local/bin/* /usr/local/bin/
 COPY --chown=imtl --from=builder /install /
 COPY --chown=imtl --from=builder "${MTL_REPO}/build" "/home/imtl"
 COPY --chown=imtl --from=builder "${MTL_REPO}/tests/tools/RxTxApp/build/RxTxApp" "/home/imtl/RxTxApp"
 COPY --chown=imtl --from=builder "${MTL_REPO}/tests/tools/RxTxApp/script" "/home/imtl/scripts"
+COPY --chown=imtl --from=builder "${MTL_REPO}/script" "/home/imtl/script"
 
 RUN ldconfig
 SHELL ["/bin/bash", "-c"]

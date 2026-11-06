@@ -25,6 +25,10 @@
 #define UT30_CHANNELS 2
 #define UT30_PKT_PAYLOAD 192
 
+/* Bytes kept past the declared bitmap. A helper that trusts the packet index
+ * writes into them, and ut30_bitmap_guard_intact() sees it. */
+#define UT30_BITMAP_GUARD 16
+
 /* ── opaque context ───────────────────────────────────────────────────── */
 
 struct ut30_test_ctx {
@@ -35,6 +39,7 @@ struct ut30_test_ctx {
   struct st_frame_trans frames[UT30_FRAME_STORAGE];
   uint8_t frame_storage[UT30_FRAME_STORAGE][UT30_FRAME_CAPACITY];
   uint8_t* bitmap_storage;
+  size_t bitmap_alloc_bytes; /* declared size plus UT30_BITMAP_GUARD */
 
   bool hold_frames;
 
@@ -45,6 +50,7 @@ struct ut30_test_ctx {
   /* ordered log of delivered frames for timeline assertions */
   uint64_t rec_ts[64];
   int rec_status[64];
+  const void* rec_addr[64];
   int rec_n;
 };
 
@@ -74,6 +80,7 @@ static int ut30_notify_frame_ready(void* priv, void* frame,
     if (ctx->rec_n < (int)(sizeof(ctx->rec_ts) / sizeof(ctx->rec_ts[0]))) {
       ctx->rec_ts[ctx->rec_n] = meta->timestamp;
       ctx->rec_status[ctx->rec_n] = meta->status;
+      ctx->rec_addr[ctx->rec_n] = frame;
       ctx->rec_n++;
     }
   }
@@ -156,12 +163,15 @@ ut30_test_ctx* ut30_ctx_create(int num_port) {
       (uint32_t)(s->st30_frame_size / (st30_get_sample_size(s->ops.fmt) * UT30_CHANNELS));
   s->samples_per_pkt =
       (uint32_t)(s->pkt_len / (st30_get_sample_size(s->ops.fmt) * UT30_CHANNELS));
-  ctx->bitmap_storage = calloc(1, ((size_t)s->st30_total_pkts + 7) / 8);
+  size_t bitmap_size = ((size_t)s->st30_total_pkts + 7) / 8;
+  ctx->bitmap_alloc_bytes = bitmap_size + UT30_BITMAP_GUARD;
+  ctx->bitmap_storage = calloc(1, ctx->bitmap_alloc_bytes);
   if (!ctx->bitmap_storage) {
     free(ctx);
     return NULL;
   }
   s->frame_bitmap = ctx->bitmap_storage;
+  s->frame_bitmap_size = bitmap_size;
 
   s->port_maps[MTL_SESSION_PORT_P] = MTL_PORT_P;
   s->port_maps[MTL_SESSION_PORT_R] = MTL_PORT_R;
@@ -222,11 +232,7 @@ static struct rte_mbuf* make_audio_mbuf(uint16_t seq, uint32_t ts) {
 
 int ut30_feed_pkt(ut30_test_ctx* ctx, uint16_t seq, uint32_t ts,
                   enum mtl_session_port port) {
-  struct rte_mbuf* m = make_audio_mbuf(seq, ts);
-  if (!m) return -1;
-  int rc = rx_audio_session_handle_frame_pkt(&ctx->impl, &ctx->session, m, port);
-  rte_pktmbuf_free(m);
-  return rc;
+  return ut30_feed_pkt_fill(ctx, seq, ts, port, 0);
 }
 
 void ut30_feed_burst(ut30_test_ctx* ctx, uint16_t seq_start, int count, uint32_t ts,
@@ -235,6 +241,17 @@ void ut30_feed_burst(ut30_test_ctx* ctx, uint16_t seq_start, int count, uint32_t
   for (int i = 0; i < count; i++) {
     ut30_feed_pkt(ctx, seq_start + i, ts + (uint32_t)i * spp, port);
   }
+}
+
+int ut30_feed_pkt_fill(ut30_test_ctx* ctx, uint16_t seq, uint32_t ts,
+                       enum mtl_session_port port, uint8_t fill) {
+  struct rte_mbuf* m = make_audio_mbuf(seq, ts);
+  if (!m) return -1;
+  memset(rte_pktmbuf_mtod(m, uint8_t*) + sizeof(struct st_rfc3550_audio_hdr), fill,
+         UT30_PKT_PAYLOAD);
+  int rc = rx_audio_session_handle_frame_pkt(&ctx->impl, &ctx->session, m, port);
+  rte_pktmbuf_free(m);
+  return rc;
 }
 
 int ut30_feed_pkt_pt(ut30_test_ctx* ctx, uint16_t seq, uint32_t ts,
@@ -285,6 +302,10 @@ void ut30_ctx_set_ssrc(ut30_test_ctx* ctx, uint32_t ssrc) {
   ctx->session.ops.ssrc = ssrc;
 }
 
+void ut30_ctx_set_flags(ut30_test_ctx* ctx, uint32_t flags) {
+  ctx->session.ops.flags = flags;
+}
+
 /* ── stat accessors ───────────────────────────────────────────────────── */
 
 uint64_t ut30_stat_unrecovered(const ut30_test_ctx* ctx) {
@@ -331,8 +352,32 @@ int ut30_pkts_per_frame(const ut30_test_ctx* ctx) {
   return ctx->session.st30_total_pkts;
 }
 
+uint32_t ut30_pkt_len(const ut30_test_ctx* ctx) {
+  return ctx->session.pkt_len;
+}
+
 uint32_t ut30_samples_per_pkt(const ut30_test_ctx* ctx) {
   return ctx->session.samples_per_pkt;
+}
+
+void ut30_set_samples_per_pkt(ut30_test_ctx* ctx, uint32_t spp) {
+  ctx->session.samples_per_pkt = spp;
+}
+
+bool ut30_bitmap_guard_intact(const ut30_test_ctx* ctx) {
+  for (size_t i = ctx->session.frame_bitmap_size; i < ctx->bitmap_alloc_bytes; i++) {
+    if (ctx->bitmap_storage[i] != 0) return false;
+  }
+  return true;
+}
+
+bool ut30_spare_frame_storage_intact(const ut30_test_ctx* ctx) {
+  for (int i = ctx->session.st30_frames_cnt; i < UT30_FRAME_STORAGE; i++) {
+    for (size_t j = 0; j < UT30_FRAME_CAPACITY; j++) {
+      if (ctx->frame_storage[i][j] != 0) return false;
+    }
+  }
+  return true;
 }
 
 int ut30_frame_log_count(const ut30_test_ctx* ctx) {
@@ -347,6 +392,11 @@ uint64_t ut30_frame_log_ts(const ut30_test_ctx* ctx, int i) {
 int ut30_frame_log_status(const ut30_test_ctx* ctx, int i) {
   if (i < 0 || i >= ctx->rec_n) return -1;
   return ctx->rec_status[i];
+}
+
+const void* ut30_frame_log_addr(const ut30_test_ctx* ctx, int i) {
+  if (i < 0 || i >= ctx->rec_n) return NULL;
+  return ctx->rec_addr[i];
 }
 
 uint64_t ut30_stat_port_pkts(const ut30_test_ctx* ctx, enum mtl_session_port port) {
@@ -376,6 +426,10 @@ uint64_t ut30_stat_port_duplicates(const ut30_test_ctx* ctx, enum mtl_session_po
 uint64_t ut30_stat_port_err_packets(const ut30_test_ctx* ctx,
                                     enum mtl_session_port port) {
   return ctx->session.port_user_stats.common.port[port].err_packets;
+}
+
+uint64_t ut30_stat_frames_incomplete(const ut30_test_ctx* ctx) {
+  return ctx->session.port_user_stats.stat_frames_incomplete;
 }
 
 uint64_t ut30_stat_wrong_pt(const ut30_test_ctx* ctx) {
@@ -429,4 +483,17 @@ void ut30_feed_full_frame(ut30_test_ctx* ctx, uint16_t seq_start, uint32_t ts_st
 
 void ut30_invoke_rx_audio_session_stat(ut30_test_ctx* ctx) {
   rx_audio_session_stat(&ctx->mgr, &ctx->session);
+}
+
+int ut30_ops_check_source(const struct st_rx_source_info* src) {
+  struct st30_rx_ops ops;
+
+  memset(&ops, 0, sizeof(ops));
+  ops.num_port = 2;
+  memcpy(ops.ip_addr, src->ip_addr, sizeof(ops.ip_addr));
+  ops.type = ST30_TYPE_FRAME_LEVEL;
+  ops.framebuff_cnt = 2;
+  ops.framebuff_size = 1024;
+  ops.notify_frame_ready = ut30_notify_frame_ready;
+  return rx_audio_ops_check(&ops);
 }

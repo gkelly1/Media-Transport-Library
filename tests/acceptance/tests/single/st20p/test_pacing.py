@@ -5,7 +5,7 @@
 import pytest
 from common.nicctl import InterfaceSetup
 from mtl_engine import ip_pools
-from mtl_engine.media_files import yuv_files
+from mtl_engine.media_files import parse_fps_to_pformat, yuv_files
 
 pytestmark = pytest.mark.verified
 
@@ -21,6 +21,12 @@ CORE = ["i1080p59", "i2160p59", "i2160p119"]
             "ffmpeg",
             marks=pytest.mark.skip(
                 reason="FFmpeg does not support pacing mode selection"
+            ),
+        ),
+        pytest.param(
+            "gstreamer",
+            marks=pytest.mark.skip(
+                reason="GStreamer does not support pacing mode selection"
             ),
         ),
     ],
@@ -63,7 +69,7 @@ def test_st20p_pacing(
         "port": 20000,
         "width": media_file_info["width"],
         "height": media_file_info["height"],
-        "framerate": f"p{media_file_info['fps']}",
+        "framerate": parse_fps_to_pformat(media_file_info["fps"]),
         "pixel_format": media_file_info["file_format"],
         "transport_format": media_file_info["format"],
         "input_file": media_file_path,

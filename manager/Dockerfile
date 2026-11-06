@@ -6,7 +6,7 @@
 # Please review and modify as necessary before using in a production environment.
 
 # Build stage, ubuntu 24.04
-FROM ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b AS builder
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS builder
 
 LABEL maintainer="andrzej.wilczynski@intel.com,dawid.wesierski@intel.com,marek.kasiewicz@intel.com"
 
@@ -18,8 +18,11 @@ ARG VERSION
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends git build-essential pkg-config m4 clang llvm zlib1g-dev libelf-dev libpcap-dev libcap-ng-dev meson gcc-multilib ca-certificates
 
-# Clone and build the xdp-tools project
-RUN git clone --recurse-submodules https://github.com/xdp-project/xdp-tools.git
+# Clone and build the xdp-tools project. Its libbpf submodule can be older than EBPF_VER
+# in versions.env, so check out that release instead, as script/build_ebpf_xdp.sh does.
+# Change this tag whenever EBPF_VER changes.
+RUN git clone --recurse-submodules https://github.com/xdp-project/xdp-tools.git && \
+    git -C xdp-tools/lib/libbpf checkout v1.7.0
 WORKDIR /xdp-tools
 RUN ./configure && make && \
     make install && \
@@ -28,7 +31,9 @@ WORKDIR /xdp-tools/lib/libbpf/src
 RUN make install && \
     DESTDIR=/install make install
 
-COPY . /manager
+# The context is the repository root: meson.build reads the hardening flags from script/.
+COPY manager /manager
+COPY script/hardening_flags.py /script/
 RUN \
     if [ -z "${VERSION}" ]; then \
         VERSION="0.0.1.DOCKER"; \
@@ -41,10 +46,11 @@ RUN meson setup build && \
     DESTDIR=/install meson install -C build
 
 # Runtime stage, ubuntu 24.04
-FROM ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS final
 
 # Install runtime dependencies
 RUN apt-get update -y && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends ethtool libelf1 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

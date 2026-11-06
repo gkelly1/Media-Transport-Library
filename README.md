@@ -1,14 +1,17 @@
 # Media Transport Library
 
 > [!TIP]
-> [Full Documentation](https://openvisualcloud.github.io/Media-Transport-Library/README.html) for [Media Transport Library](https://openvisualcloud.github.io/Media-Transport-Library/README.html).
+> [Full Documentation](https://openvisualcloud.github.io/Media-Transport-Library/) for [Media Transport Library](https://openvisualcloud.github.io/Media-Transport-Library/).
+
+[![License](https://img.shields.io/badge/license-BSD_3_Clause-stable.svg)](https://github.com/OpenVisualCloud/Media-Transport-Library/blob/main/LICENSE)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/OpenVisualCloud/Media-Transport-Library/badge)](https://securityscorecards.dev/viewer/?uri=github.com/OpenVisualCloud/Media-Transport-Library)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/7351/badge)](https://www.bestpractices.dev/projects/7351)
 
 [![Base build](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/base_build.yml/badge.svg)](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/base_build.yml)
-[![Test](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/ubuntu_build_with_gtest.yml/badge.svg)](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/ubuntu_build_with_gtest.yml)
-[![OpenSSF
-Scorecard](https://api.securityscorecards.dev/projects/github.com/OpenVisualCloud/Media-Transport-Library/badge)](https://api.securityscorecards.dev/projects/github.com/OpenVisualCloud/Media-Transport-Library)
-[![Dependency Review](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/dependency-review.yml)
 [![Coverity Scan Build Status](https://scan.coverity.com/projects/30596/badge.svg)](https://scan.coverity.com/projects/media-transport-library)
+[![PR check Status](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/cicd-pr-check.yml/badge.svg)](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/cicd-pr-check.yml)
+[![Trivy Scan Status](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/trivy.yml/badge.svg)](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/trivy.yml)
+[![Dependency Review](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/OpenVisualCloud/Media-Transport-Library/actions/workflows/dependency-review.yml)
 
 > [!IMPORTANT]  
 > All Source code and features on the main branch are for the purpose of testing or evaluation and not production ready. Evaluated code is tagged with the corresponding release version.
@@ -28,7 +31,7 @@ If you find value in our project, please consider giving it a star. Your support
 * Multi-process handling, allowing for up to 8 NICs per process.
 * Virtualization support by SR-IOV.
 * Built-in PTP protocol with hardware timestamp offload.
-* FFMPEG plugin, OBS(Open Broadcaster Software) plugin, and Intel® Media SDK support.
+* FFMPEG plugin, OBS(Open Broadcaster Software) plugin.
 * In addition to the native C/C++ API, it also offers bindings for [Python](python/README.md) and [Rust](rust/README.md).
 
 #### 1.1.1. ST2110 features
@@ -75,9 +78,32 @@ However, please note that our daily development and validation is primarily cond
 
 An important point to note is that narrow pacing of TX is only supported for the Intel E810 and E830 series together with DPDK PMD due to the rate limit feature. All other type of usage have to use TSC (Timestamp Counter) as the pacing source, which can only ensure a broad wide pacing.
 
+### 1.4. Platform support matrix
+
+This matrix shows the tests that continuous integration runs for each operating system.
+It does not limit MTL to these operating systems.
+MTL should build and run on other Linux systems that provide the required compiler, DPDK, and library dependencies.
+A system without hardware validation is not known to be incompatible.
+
+| Operating system | Container build | Unit tests | Bare-metal integration tests | Acceptance tests | Validation kernel |
+| --- | --- | --- | --- | --- | --- |
+| Ubuntu 22.04 LTS | Yes | Yes | Not run in CI | Not run in CI | Not applicable |
+| Ubuntu 24.04 LTS | Yes | Yes | Yes, E810/E830/E835 | Yes, smoke and nightly suites | `6.8.0-137-generic` |
+| Ubuntu 26.04 LTS | Yes | Yes | Not run in CI | Not run in CI | Not applicable |
+| Rocky Linux 9 | Yes | Yes | Not run in CI | Not run in CI | Not applicable |
+| Other Linux systems | Expected | Not run in CI | Not run in CI | Not run in CI | Not applicable |
+
+The container build includes DPDK, MTL, sample applications, plugins, and the selected data path backends.
+The unit tests run without a NIC or root access.
+The bare-metal integration tests run the C++ gtest suite with physical NICs.
+The hardware validation runs the end-to-end pytest suites with media traffic.
+
+The Ubuntu 24.04 validation kernel value records the fleet state on September 18, 2026.
+Kernel updates can change this value without changing the supported operating system.
+
 ## 2. Build
 
-Please refer to [Build Guide](doc/build.md) for instructions on how to build DPDK, the library, and the sample application. Guidance for the fuzz targets lives in [doc/fuzzing.md](doc/fuzzing.md).
+Please refer to [Build Guide](doc/build.md) for instructions on how to build DPDK, the library, and the sample application. Guidance for the fuzz targets lives in [tests/doc/fuzz/index.rst](tests/doc/fuzz/index.rst).
 
 For Windows, please refer to the [Windows Build Guide](doc/build_WIN.md) for instructions on how to build.
 

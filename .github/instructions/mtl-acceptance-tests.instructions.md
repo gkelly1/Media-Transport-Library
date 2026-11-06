@@ -1,5 +1,5 @@
 ---
-description: "Use when the user asks to RUN, collect, debug, or diagnose pytest cases under tests/acceptance/tests/single/ (st20p, st22p, st30p, st40p, st41, ffmpeg, gstreamer, dma, ptp, rss_mode, rx_timing, udp, virtio_user, xdp, kernel_socket); running by marker (-m smoke/-m nightly); investigating logs under tests/acceptance/logs/. For AUTHORING new cases see mtl-acceptance-authoring.instructions.md. For host setup (build, hugepages, NFS, configs): call `.github/scripts/acceptance_setup.sh status`/`setup` (interactive, prompts for NFS/PF/EBU choices) or the `mtl-acceptance-setup` MCP tools directly — no dedicated agent."
+description: "Use when the user asks to RUN, collect, debug, or diagnose pytest cases under tests/acceptance/tests/single/ (st20p, st22p, st30p, st40, st40p, ffmpeg, gstreamer, dma, ptp, rss_mode, rx_timing, udp, virtio_user, xdp, kernel_socket); running by marker (-m smoke/-m nightly); investigating logs under tests/acceptance/logs/. For AUTHORING new cases see mtl-acceptance-authoring.instructions.md. For host setup (build, hugepages, NFS, configs): call `.github/scripts/acceptance_setup.sh status`/`setup` (interactive, prompts for NFS/PF/EBU choices) or the `mtl-acceptance-setup` MCP tools directly — no dedicated agent."
 name: "MTL Acceptance Tests — Run Tests"
 applyTo: "tests/acceptance/tests/single/**"
 ---
@@ -65,9 +65,9 @@ hardware-bound). The full marker set and its authoring rules live in
 
 | Category | Backend | Build artifact |
 |---|---|---|
-| `st20p`/`st22p`/`st30p`/`st40p`/`st41`/`dma`/`ptp`/`rss_mode`/`rx_timing`/`udp`/`virtio_user`/`xdp`/`kernel_socket` | RxTxApp | `.local_install/mtl/bin/RxTxApp` |
-| `ffmpeg/` | in-repo FFmpeg + MTL muxer | `ecosystem/ffmpeg_plugin/FFmpeg-release-*/ffmpeg` (system ffmpeg unused) |
-| `gstreamer/` | in-repo GStreamer plugin | `ecosystem/gstreamer_plugin/builddir/libgstmtl_*.so` |
+| `st20p`/`st22p`/`st30p`/`st40`/`st40p`/`dma`/`ptp`/`rss_mode`/`rx_timing`/`udp`/`virtio_user`/`xdp`/`kernel_socket` | RxTxApp | `.local_install/mtl/bin/RxTxApp` |
+| `ffmpeg/` | in-repo FFmpeg + MTL muxer | `.local_install/ffmpeg/bin/ffmpeg`, built by `script/build_ffmpeg_plugin.sh` (system ffmpeg unused) |
+| `gstreamer/` | in-repo GStreamer plugin | `.local_install/gstreamer/gstreamer-1.0/libgstmtl_*.so`, built by `script/build_gstreamer_plugin.sh` |
 | `performance/` | RxTxApp capacity sweep | RxTxApp; very long |
 
 ## Logs
@@ -87,6 +87,8 @@ sudo grep -E "EAL|hugepage|VF|RxTxApp|RemoteProcess|Traceback|err:" \
 | `No module named pytest` / `pytest_mfd_config` | You used `sudo python3`. Re-run with `sudo -E ./venv/bin/python3`. |
 | `unrecognized arguments: --topology_config` | Run from `tests/acceptance/` (local `conftest.py` registers the plugin). |
 | Test hung > test_time + ~30 s | Stale process. `sudo pkill -9 RxTxApp MtlManager ffmpeg gst-launch-1.0` and retry. |
+| Test hung for hours, no output, idle `audio_integrity.py`, pytest in `futex_wait_queue` | The checker printed past the ~2 MiB paramiko channel window, which `mfd_connect` drains only at command exit. `audio_integrity.py` caps per-frame reports (`MAX_BAD_FRAME_REPORTS`); `video_integrity.py` reports per frame, far under. `integrity_runner.py` bounds file-mode checks at `_INTEGRITY_TIMEOUT`. |
+| `is missing N frame(s) of audio within its first 5` (st30p, still PASSED) | Expected: the RX joins a stream in flight, so MTL suppresses its first short frames (`JOIN_FRAMES`/`MAX_JOIN_GAP_FRAMES` in `audio_integrity.py`). A wider gap, or one in a later segment, fails. |
 | `EBU server configuration not found` (test still PASSED) | Data path passed; compliance verdict was skipped. Re-run setup with `--ebu-ip=`/`--ebu-user=`/`--ebu-password=`/`--capture-pci-device=` (ask the user first) so `ebu_server`/`capture_cfg` get populated in `test_config.yaml`. |
 | `netsniff-ng: command not found` | `sudo apt install -y netsniff-ng`. |
 | `build_dpdk.sh: line ...: unzip: command not found` | **(setup)** Fixed: `unzip` now in base apt deps. Re-run setup. |
@@ -94,7 +96,7 @@ sudo grep -E "EAL|hugepage|VF|RxTxApp|RemoteProcess|Traceback|err:" \
 | `RemoteProcessInvalidState: Process is finished` (ffmpeg) | **(setup)** In-repo ffmpeg/libav not installed. |
 | RxTxApp exit `127` with `error while loading shared libraries: librte_*.so.26` | **(setup)** DPDK is installed but the dynamic linker cache is stale. Re-run setup (it refreshes `ldconfig`) or run `sudo ldconfig`, then confirm `ldd .local_install/mtl/bin/RxTxApp` has no `not found`. |
 | `RuntimeError: Failed to start MtlManager on host` (pytest `mtl_manager` fixture, setup error not a test failure) | **(setup)** `.local_install/mtl/bin/MtlManager` missing — the host only has the system-wide gtest build. Run `acceptance_setup.sh setup --base-only`; the `build_mtl`/`dpdk_build` MCP tools target `build/` + `/usr/local` instead, which pytest doesn't use. |
-| `Media file not present on <host>: /mnt/media/...` (SKIPPED) | **(setup)** NFS empty/unmounted. ASK the user for the NFS source; never skip silently. |
+| `Media file not present on <host>: /mnt/media/...` (ERROR) | **(setup)** NFS empty/unmounted. ASK the user for the NFS source; never skip silently. |
 | `cp: cannot stat /mnt/media/...` | **(setup)** Same — NFS not populated. |
 | `mount: bad option ... mount.<type> helper` | **(setup)** `nfs-common` missing. |
 | `SSHConnection.__init__() missing … 'password'` | **(setup)** Topology needs `password: ''`. |
@@ -102,7 +104,7 @@ sudo grep -E "EAL|hugepage|VF|RxTxApp|RemoteProcess|Traceback|err:" \
 | `TypeError: 'ExtraInfoModel' object is not subscriptable` | **(setup)** Stale `extra_info.custom_interface`. |
 | `capture_cfg.sniff_pci_device=<BDF> not found` | **(setup)** Same — vendor:device not BDF. Config generation patches this automatically; if it's still a raw BDF the config predates that fix, so regenerate it with `acceptance_setup.sh setup --pytest-only`. |
 | EAL hugepage / VF binding error in logs | **(setup)** Hugepages exhausted or VFs not on `vfio-pci`. |
-| RxTxApp `Segmentation fault` inside `iavf_tm_node_add` (after `dev_if_init_pacing(0), try rl as drv support TM`) | **(setup)** Stock kernel ice loaded instead of the MTL out-of-tree patched ice (`versions.env::ICE_VER`). Re-run setup — the ice stage version-checks and reloads automatically. |
+| RxTxApp `Segmentation fault` inside `iavf_tm_node_add` (after `dev_if_init_pacing(0), try rl as drv support TM`) | **(setup)** In-tree ice loaded instead of the out-of-tree ice of `versions.env::ICE_VER`. Re-run setup — the ice stage version-checks and reloads automatically. |
 | RxTxApp `Segmentation fault` anywhere else | **NOT setup.** Capture `gdb -batch -ex 'bt full' .local_install/mtl/bin/RxTxApp /tmp/core.*` (or `coredumpctl gdb RxTxApp`) and report upstream as a real MTL/DPDK bug. Do **not** add a workaround. |
 | `Permission denied (publickey)` to `root@127.0.0.1` | **(setup)** Pubkey not in `/root/.ssh/authorized_keys`. |
 

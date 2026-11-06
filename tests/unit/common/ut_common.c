@@ -6,6 +6,7 @@
 
 #include "ut_common.h"
 
+#include <rte_malloc.h>
 #include <rte_mbuf_dyn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,13 +64,63 @@ void ut_ring_drain(struct rte_ring* ring) {
 
 /* ── HW RX timestamp mock ─────────────────────────────────────────────── */
 
+static int g_rx_timestamp_offset = -1;
+static uint64_t g_rx_timestamp_flag;
+
 int ut_register_hw_rx_timestamp(void) {
-  static int g_offset = -1;
-  if (g_offset < 0 && rte_mbuf_dyn_rx_timestamp_register(&g_offset, NULL) < 0) return -1;
-  return g_offset;
+  if (g_rx_timestamp_offset < 0 && rte_mbuf_dyn_rx_timestamp_register(
+                                       &g_rx_timestamp_offset, &g_rx_timestamp_flag) < 0)
+    return -1;
+  return g_rx_timestamp_offset;
+}
+
+uint64_t ut_hw_rx_timestamp_flag(void) {
+  if (ut_register_hw_rx_timestamp() < 0) return 0;
+  return g_rx_timestamp_flag;
 }
 
 void ut_mbuf_set_hw_timestamp(struct rte_mbuf* mbuf, int dynfield_offset,
                               uint64_t raw_ns) {
   *RTE_MBUF_DYNFIELD(mbuf, dynfield_offset, rte_mbuf_timestamp_t*) = raw_ns;
+  mbuf->ol_flags |= ut_hw_rx_timestamp_flag();
+}
+
+uint64_t ut_rte_alloc_count(void) {
+  uint64_t count = 0;
+  for (unsigned int i = 0; i < rte_socket_count(); i++) {
+    struct rte_malloc_socket_stats stats;
+    if (rte_malloc_get_socket_stats(rte_socket_id_by_idx(i), &stats) == 0)
+      count += stats.alloc_count;
+  }
+  return count;
+}
+
+/* ── fake clock ───────────────────────────────────────────────────────── */
+
+static bool g_clock_on;
+static uint64_t g_clock_ns;
+static uint64_t g_clock_step_ns;
+
+void ut_clock_start(uint64_t now_ns, uint64_t step_ns) {
+  g_clock_on = true;
+  g_clock_ns = now_ns;
+  g_clock_step_ns = step_ns;
+}
+
+void ut_clock_stop(void) {
+  g_clock_on = false;
+}
+
+bool ut_clock_on(void) {
+  return g_clock_on;
+}
+
+uint64_t ut_clock_tick(void) {
+  uint64_t now = g_clock_ns;
+  g_clock_ns += g_clock_step_ns;
+  return now;
+}
+
+uint64_t ut_clock_ns(void) {
+  return g_clock_ns;
 }

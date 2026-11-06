@@ -295,7 +295,7 @@ enum mtl_net_proto {
 enum mtl_transport_type {
   /** st2110 protocol transport */
   MTL_TRANSPORT_ST2110 = 0,
-  /** udp transport */
+  /** udp transport, unused since the user-space UDP stack was removed */
   MTL_TRANSPORT_UDP,
   /** max value of this enum */
   MTL_TRANSPORT_TYPE_MAX,
@@ -343,9 +343,9 @@ enum mtl_init_flag {
   /** Separated lcore for RX video(st2110-20/st2110-22) sessions. */
   MTL_FLAG_RX_SEPARATE_VIDEO_LCORE = (MTL_BIT64(2)),
   /**
-   * Enable migrate mode for rx video session if current LCORE is too busy to handle the
-   * rx video tasklet, the busy session may be migrated to a new LCORE.
-   * If not enable, rx video will always use static mapping based on quota.
+   * Enable migrate mode for tx video session if current LCORE is too busy to handle the
+   * tx video tasklet, the busy session may be migrated to a new LCORE.
+   * If not enable, tx video will always use static mapping based on quota.
    */
   MTL_FLAG_TX_VIDEO_MIGRATE = (MTL_BIT64(3)),
   /**
@@ -377,6 +377,7 @@ enum mtl_init_flag {
   MTL_FLAG_PTP_PI = (MTL_BIT64(9)),
   /**
    * Enable background lcore mode for MTL_TRANSPORT_UDP.
+   * Unused since the user-space UDP stack was removed.
    */
   MTL_FLAG_UDP_LCORE = (MTL_BIT64(10)),
   /**
@@ -495,6 +496,11 @@ enum mtl_init_flag {
    * correctly; a session whose every port is down will still fail to create.
    */
   MTL_FLAG_ALLOW_DOWN_PORTS = (MTL_BIT64(48)),
+  /**
+   * Find the DMA devices without dma_dev_port. MTL probes each Intel CBDMA or DSA
+   * device on vfio-pci on the NUMA node of a port. Linux only.
+   */
+  MTL_FLAG_DMA_AUTO = (MTL_BIT64(49)),
 
   /** Debug option to enable dropping some percentage of packets for
    *  testing redundant video streams only works for video, needs the
@@ -547,6 +553,14 @@ struct mtl_port_init_params {
    * the detail.
    */
   int socket_id;
+  /**
+   * Optional for MTL_PMD_DPDK_USER. TX scheduler rate limit burst size in bytes, passed
+   * to the ice PF driver as the rl_burst_size devarg on this port. Zero keeps the
+   * hardware default. Only set this for a port DPDK drives as an ice PF: the iavf driver
+   * rejects the key, so a VF port fails to probe with -EINVAL. The ice driver validates
+   * the range and fails the probe if the value is out of it.
+   */
+  uint32_t rl_burst_size;
 };
 
 /**
@@ -616,8 +630,9 @@ struct mtl_init_params {
   /** Optional. log level control */
   enum mtl_log_level log_level;
   /**
-   * Optional. The logical cores list can be used in the MTL, e.g. "28,29,30,31".
-   * If not assigned, the core usage will be determined by MTL itself.
+   * Optional. The logical cores list can be used in the MTL, e.g. "28,29,30,31", in the
+   * syntax of the DPDK -l option, by CPU id. If not assigned, MTL uses the CPUs of the
+   * process affinity.
    */
   char* lcores;
 
@@ -724,7 +739,7 @@ struct mtl_init_params {
   /** Optional, all future port params should be placed into this struct */
   struct mtl_port_init_params port_params[MTL_PORT_MAX];
 
-  /* The Core ID designated for the DPDK main thread. If set to 0, the DPDK default core
+  /* The CPU id designated for the DPDK main thread. If set to 0, the DPDK default core
    * is used. */
   uint32_t main_lcore;
 
@@ -1162,14 +1177,15 @@ int mtl_bind_to_lcore(mtl_handle mt, pthread_t thread, unsigned int lcore);
 int mtl_put_lcore(mtl_handle mt, unsigned int lcore);
 
 /**
- * Performance optimized memcpy, e.g. AVX-512.
+ * Copy memory with the copy that the library uses for its own data. Same
+ * contract as the C library memcpy: the two areas must not overlap.
  *
  * @param dest
  *   Pointer to the destination of the data.
  * @param src
  *   Pointer to the source data.
  * @param n
- *   Number of bytes to copy..
+ *   Number of bytes to copy.
  * @return
  *   - Pointer to the destination data.
  */

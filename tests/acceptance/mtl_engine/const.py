@@ -36,6 +36,9 @@ DPDK_LIB_PATH = f"{PREFIX}/dpdk/lib/x86_64-linux-gnu"
 FFMPEG_LIB_PATH = f"{PREFIX}/ffmpeg/lib"
 GSTREAMER_LIB_PATH = f"{PREFIX}/gstreamer/gstreamer-1.0"
 PLUGIN_PATH = f"{PREFIX}/plugins/lib/x86_64-linux-gnu"
+# The plugin registry build.sh writes, with the absolute plugin paths.
+KAHAWAI_CFG = f"{PREFIX}/conf/kahawai.json"
+ISOLATE_SH = "tests/tools/isolate/isolate.sh"  # relative to mtl_path
 
 
 LD_LIB_PATH_REL = f"{MTL_LIB_PATH}:{DPDK_LIB_PATH}:{FFMPEG_LIB_PATH}:{GSTREAMER_LIB_PATH}:{PLUGIN_PATH}"

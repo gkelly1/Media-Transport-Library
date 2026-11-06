@@ -18,7 +18,7 @@ This module defines no `@mcp.tool()`s itself; it is not an MCP server.
 from __future__ import annotations
 
 import re
-import subprocess
+import subprocess  # nosec B404 # callers pass argv lists or fixed, validated commands
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -204,7 +204,7 @@ def ice_driver_status() -> str:
 
 
 def ice_driver_rebuild() -> str:
-    """Build and install the patched out-of-tree ICE driver, then reload it."""
+    """Build and install the out-of-tree ICE driver, then reload it."""
     rc, out = _call_host_lib("mh_ice_driver_rebuild", timeout=600)
 
     return (

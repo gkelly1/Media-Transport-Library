@@ -231,8 +231,6 @@ struct st_var_info {
   uint16_t st30_tx_sessions_cnt;
   /** st40 tx session count */
   uint16_t st40_tx_sessions_cnt;
-  /** st41 tx session count */
-  uint16_t st41_tx_sessions_cnt;
   /** st20 rx session count */
   uint16_t st20_rx_sessions_cnt;
   /** st22 rx session count */
@@ -241,8 +239,6 @@ struct st_var_info {
   uint16_t st30_rx_sessions_cnt;
   /** st40 rx session count */
   uint16_t st40_rx_sessions_cnt;
-  /** st41 rx session count */
-  uint16_t st41_rx_sessions_cnt;
 };
 
 /**
@@ -277,7 +273,7 @@ struct st_rx_port_stats {
    *       Sister field (video-only): `st20_rx_user_stats::frames_partial[i]`
    *       (this port was short, but the redundant port covered the gap).
    *
-   *   - Few packets per frame   (Audio ST30, Ancillary ST40, Metadata ST41):
+   *   - Few packets per frame   (Audio ST30, Ancillary ST40 incl. fast metadata):
    *       Increments when a new frame's **first** packet arrives on this
    *       port — i.e. this port "won the race" for that frame.
    *
@@ -302,7 +298,7 @@ struct st_rx_port_stats {
   /**
    * Per-port count of packets that arrived out of order on this port.
    *
-   * For audio (ST30), ancillary (ST40), fast-metadata (ST41): incremented
+   * For audio (ST30) and ancillary (ST40, incl. fast metadata): incremented
    * when an RTP packet arrives with seq strictly less than the highest seq
    * previously seen on this port (intra-port reorder; same-port duplicates
    * go to duplicates_same_port instead).
@@ -322,7 +318,7 @@ struct st_rx_port_stats {
    * accepted on this port (genuine same-port duplicate, distinct from the
    * normal cross-port redundant copy counted by stat_pkts_redundant).
    *
-   * Tracked for audio (ST30), ancillary (ST40), fast-metadata (ST41).
+   * Tracked for audio (ST30) and ancillary (ST40, incl. fast metadata).
    * Always 0 for video (ST20/ST22): the slot+bitmap completion model
    * cannot distinguish a same-port duplicate from a normal cross-port
    * redundant copy, so both surface as stat_pkts_redundant.
@@ -427,7 +423,7 @@ struct st_rx_user_stats {
 
   /* ------------------------------------------------------------------ */
   /*  Pipeline layer — filled by ST20p / ST22p / ST30p / ST40p only.    */
-  /*  Always 0 for transport-only RX paths (e.g. raw RTP, ST41).        */
+  /*  Always 0 for transport-only RX paths (e.g. ST40 RTP level).       */
   /* ------------------------------------------------------------------ */
 
   /**
@@ -437,7 +433,7 @@ struct st_rx_user_stats {
    * port[i].frames, whose semantics differ between video and
    * audio/anc/fmd. Populated by pipeline RX session types
    * (ST20p / ST22p / ST30p / ST40p); 0 for transport-only RX paths that
-   * deliver RTP packets rather than frames (e.g. ST41).
+   * deliver RTP packets rather than frames (e.g. ST40 RTP level).
    */
   uint64_t stat_frames_received;
   /**
@@ -451,11 +447,11 @@ struct st_rx_user_stats {
   /**
    * Total frames delivered with status ST_FRAME_STATUS_CORRUPTED, i.e.
    * frames whose constituent packets had unrecoverable gaps after
-   * redundancy. The frame is still handed to the application; the
-   * application should consult frame->status to decide what to do.
+   * redundancy. ST40p hands such a frame up unconditionally; ST20p and ST30p
+   * only when the app set that media type's RECEIVE_INCOMPLETE_FRAME flag.
    * Populated by RX session types that classify per-frame integrity
    * (ST20p, ST30p, ST40p). Always 0 for types with no per-frame
-   * corruption concept (ST41).
+   * corruption concept (e.g. ST40 RTP level).
    */
   uint64_t stat_frames_corrupted;
 };
@@ -497,7 +493,11 @@ static inline bool st_is_frame_complete(enum st_frame_status status) {
 double st_frame_rate(enum st_fps fps);
 
 /**
- * Helper function returning enum st_fps from frame rate
+ * Helper function returning enum st_fps from frame rate.
+ * Matching is tolerant: a rate outside the ST 2110 set may be snapped to a listed rate
+ * whose match window it falls in, in which case the transport paces at the snapped rate
+ * rather than the requested one and a warning is logged. The windows are per-rate and
+ * asymmetric. Rates outside every window return ST_FPS_MAX.
  *
  * @param framerate
  *   frame rate number
@@ -553,6 +553,36 @@ uint32_t st10_tai_to_media_clk(uint64_t tai_ns, uint32_t sampling_rate);
 uint64_t st10_media_clk_to_ns(uint32_t media_ts, uint32_t sampling_rate);
 
 /**
+ * Helper function to unwrap a raw ST2110-10 media clock tick count into the TAI
+ * instant nearest a known anchor, exactly invertible back to media_ts via
+ * st10_tai_to_media_clk().
+ *
+ * ST10_TIMESTAMP_FMT_MEDIA_CLK carries only a 32-bit tick count, not a full TAI
+ * instant, so reconstructing the real time requires picking the 32-bit tick wrap
+ * cycle nearest anchor_tai_ns. That means media_ts must represent a time within
+ * about half a wrap cycle of anchor_tai_ns -- ~6.6 hours at 90kHz (video and
+ * ancillary), ~12.4 hours at 48kHz (audio) -- or the unwrap resolves to the wrong
+ * cycle.
+ *
+ * See also ST20_TX_FLAG_USER_TIMESTAMP / ST30_TX_FLAG_USER_TIMESTAMP /
+ * ST40_TX_FLAG_USER_TIMESTAMP, which apply this same anchor/unwrap contract when
+ * the library derives the RTP timestamp on the caller's behalf.
+ *
+ * @param anchor_tai_ns
+ *   a TAI instant, in nanoseconds since the TAI epoch, known to be within about
+ *   half a wrap cycle of the true instant media_ts represents.
+ * @param media_ts
+ *   the raw media clock value defined in ST2110-10, whose units vary by sampling_rate.
+ * @param sampling_rate
+ *   sampling rate(90k for video, 48K/96K for audio). Must be nonzero; 0 returns
+ *   anchor_tai_ns unchanged.
+ * @return
+ *   time in nanoseconds since the TAI epoch.
+ */
+uint64_t st10_media_clk_to_tai(uint64_t anchor_tai_ns, uint32_t media_ts,
+                               uint32_t sampling_rate);
+
+/**
  * Helper function to get tai for both ST10_TIMESTAMP_FMT_TAI and
  * ST10_TIMESTAMP_FMT_MEDIA_CLK.
  *
@@ -598,20 +628,16 @@ static inline uint32_t st10_get_media_clk(enum st10_timestamp_fmt tfmt,
  * @param st30_sessions
  * st30 tx sessions count.
  * @param st40_sessions
- * st40 sessions count.
- * @param st41_sessions
- * st41 sessions count.
+ * st40 sessions count, fast metadata included.
  * @return
  *   queues count.
  */
 static inline uint16_t st_tx_sessions_queue_cnt(uint16_t st20_sessions,
                                                 uint16_t st30_sessions,
-                                                uint16_t st40_sessions,
-                                                uint16_t st41_sessions) {
+                                                uint16_t st40_sessions) {
   uint16_t queues = st20_sessions;
   if (st30_sessions) queues++;
   if (st40_sessions) queues++;
-  if (st41_sessions) queues++;
   return queues;
 }
 
@@ -623,17 +649,14 @@ static inline uint16_t st_tx_sessions_queue_cnt(uint16_t st20_sessions,
  * @param st30_sessions
  * st30 tx sessions count.
  * @param st40_sessions
- * st40 sessions count.
- * @param st41_sessions
- * st41 sessions count.
+ * st40 sessions count, fast metadata included.
  * @return
  *   queues count.
  */
 static inline uint16_t st_rx_sessions_queue_cnt(uint16_t st20_sessions,
                                                 uint16_t st30_sessions,
-                                                uint16_t st40_sessions,
-                                                uint16_t st41_sessions) {
-  return st20_sessions + st30_sessions + st40_sessions + st41_sessions;
+                                                uint16_t st40_sessions) {
+  return st20_sessions + st30_sessions + st40_sessions;
 }
 
 #if defined(__cplusplus)

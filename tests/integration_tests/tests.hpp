@@ -13,6 +13,8 @@
 #include <mtl/st_convert_api.h>
 #include <mtl/st_pipeline_api.h>
 
+#include <atomic>
+
 #include "test_util.h"
 
 #define TEST_LCORE_LIST_MAX_LEN (128)
@@ -166,6 +168,8 @@ int st_test_convert_plugin_unregister(struct st_tests_context* ctx);
 
 void sha_frame_check(void* args);
 
+struct fmd_annex_a;
+
 class tests_context {
  public:
   struct st_tests_context* ctx = NULL;
@@ -180,8 +184,9 @@ class tests_context {
   int packet_rec = 0;
   uint64_t start_time = 0;
   void* handle = NULL;
+  std::atomic<bool> ready{true};
   void* priv = NULL; /* private data for the test */
-  bool stop = false;
+  std::atomic<bool> stop{false};
   std::mutex mtx = {};
   std::condition_variable cv = {};
   struct st20_pgroup st20_pg = {};
@@ -228,6 +233,12 @@ class tests_context {
   int check_sha_frame_cnt = 0;
   int last_user_meta_frame_idx = 0;
   int user_meta_fail_cnt = 0;
+  int tp_fail_cnt = 0;
+  bool tp_other_fail_logged = false;
+  int field_phase_fail_cnt = 0;
+  int field_phase_unverified_cnt = 0;
+  /* ns per field period, 0 disables the interlaced field-phase check */
+  double field_period_ns = 0;
   bool out_of_order_pkt = false; /* out of order pkt index */
   int* ooo_mapping = NULL;
   int slice_cnt = 0;
@@ -253,6 +264,12 @@ class tests_context {
   bool block_get = false;
   bool rx_timing_parser = false;
   bool st40_empty_frame = false;
+  bool st40_fmd = false;
+  /* ST 2110-41 Annex A plan, owned by the test */
+  struct fmd_annex_a* st40_annex_a = nullptr;
+  uint64_t last_rx_time = 0; /* monotonic ns, 0 before the first packet */
+  uint64_t max_rx_gap = 0;   /* ns */
+  uint64_t rx_seq_lost = 0;
 };
 
 #define TEST_USER_META_MAGIC ST_PLUGIN_MAGIC('U', 'S', 'M', 'T')

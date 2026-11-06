@@ -7,6 +7,10 @@ Exercises ANC payload handling over GStreamer across frame rates, payload
 sizes, frame buffers, and RFC8331 pseudo streams to ensure pacing, metadata,
 and capture remain stable end to end when using paired virtual functions on
 a single physical port.
+
+The cases that drive TX through tx-test-mode need a debug build of the
+GStreamer plugin; seq-gap, no-marker and bad-parity also need a debug build
+of MTL. On a release build they skip with a warning.
 """
 
 import os
@@ -18,6 +22,7 @@ import mtl_engine.media_creator as media_create
 import pytest
 from common.nicctl import InterfaceSetup
 from mtl_engine import GstreamerApp, ip_pools
+from mtl_engine.const import GSTREAMER_LIB_PATH
 from mtl_engine.execute import log_info, log_warn, run
 
 
@@ -33,6 +38,38 @@ _FRAME_INFO_PATTERN = re.compile(
     r"seq_discont=(?P<seq_discont>\d+)\s+seq_lost=(?P<seq_lost>\d+)\s+"
     r"pkts_total=(?P<pkts_total>\d+)\s+pkts_recv_p=(?P<pkts_recv_p>\d+)\s+pkts_recv_r=(?P<pkts_recv_r>\d+)"
 )
+
+
+def _skip_without_tx_test_hooks(host, mtl_path, libmtl=True) -> None:
+    """Skip, with a warning, unless the TX plugin (and, with libmtl, its libmtl)
+    is a debug build.
+
+    tx-test-mode needs a debug plugin, which registers the property. The
+    packet mutation modes also need a debug libmtl, which announces
+    MTL_SIMULATE_PACKET_DROPS (mt_main.c); the paced mode does not
+    (libmtl=False), because the plugin builds its frames. The libmtl
+    checked is the one the plugin loads, not the first one in the ldconfig
+    cache: a .local_install is never in that cache, but a system copy may be.
+    """
+    plugin = os.path.join(mtl_path, GSTREAMER_LIB_PATH, "libgstmtl_st40p_tx.so")
+    lib = f"$(ldd {plugin} | awk '/libmtl\\.so/{{print $3; exit}}')"
+    notice = "MTL_SIMULATE_PACKET_DROPS is defined for this build"
+    checks = {
+        "the mtl_st40p_tx plugin has no tx-test-mode": (
+            f'grep -qaF tx-test-mode "{plugin}"',
+            "a debug build of the GStreamer plugin (build_gstreamer_plugin.sh debug)",
+        ),
+    }
+    if libmtl:
+        checks["libmtl does not announce MTL_SIMULATE_PACKET_DROPS"] = (
+            f'grep -qaF "{notice}" "{lib}"',
+            "a debug build of MTL (build.sh debugonly)",
+        )
+    for missing, (command, build) in checks.items():
+        if run(command, host=host).return_code == 1:
+            reason = f"{missing}: tx-test-mode needs {build}"
+            log_warn(reason)
+            pytest.skip(reason)
 
 
 def _append_redundant_params(
@@ -189,6 +226,15 @@ def _assert_redundant_frame_info(entries: list[dict[str, int]]) -> None:
         "Redundant stats malformed: pkts_total must be between max(pkts_recv_*) and "
         f"sum(pkts_recv_*); offending entries={invalid_stats}"
     )
+
+
+def _assert_seq_gaps_healed(entries: list[dict[str, int]]) -> None:
+    # TX pads its first 8 frames to tx-test-pkt-count (200) packets and drops the first
+    # few on P or R. seq_lost cannot see a frame's lost head, so count packets.
+    gap_frame_pkts = [e["pkts_total"] for e in entries if e["pkts_total"] > 1]
+    assert (
+        gap_frame_pkts == [200] * 8
+    ), f"The redundant path did not heal the injected seq gaps: {gap_frame_pkts}"
 
 
 def _parse_frame_info_timestamps(frame_info_text: str) -> list[int]:
@@ -468,6 +514,7 @@ def test_st40p_redundant_progressive_gap(
     Redundant ST40P progressive with TX seq-gap injection to exercise RX gap handling.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF"), count=4
     )
@@ -565,12 +612,15 @@ def test_st40p_redundant_progressive_gap(
                 host=host,
                 tx_first=False,
                 sleep_interval=4,
+                # tx-test-pkt-count pads the gap frames: the output outgrows the input.
+                skip_file_compare=True,
                 log_frame_info=True,
             )
             info_dump = run(f"cat {frame_info_path}", host=host)
             assert info_dump.return_code == 0
             entries = _parse_frame_info_entries(info_dump.stdout_text or "")
             _assert_redundant_frame_info(entries)
+            _assert_seq_gaps_healed(entries)
     finally:
         media_create.remove_file(input_file_path, host=host)
         media_create.remove_file(output_file_path, host=host)
@@ -714,6 +764,7 @@ def test_st40p_redundant_progressive_split_gap(
     Redundant ST40P split ANC with TX seq-gap injection to test RX redundancy.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF"), count=4
     )
@@ -810,12 +861,15 @@ def test_st40p_redundant_progressive_split_gap(
                 host=host,
                 tx_first=False,
                 sleep_interval=4,
+                # tx-test-pkt-count pads the gap frames: the output outgrows the input.
+                skip_file_compare=True,
                 log_frame_info=True,
             )
             info_dump = run(f"cat {frame_info_path}", host=host)
             assert info_dump.return_code == 0
             entries = _parse_frame_info_entries(info_dump.stdout_text or "")
             _assert_redundant_frame_info(entries)
+            _assert_seq_gaps_healed(entries)
     finally:
         media_create.remove_file(input_file_path, host=host)
         media_create.remove_file(output_file_path, host=host)
@@ -963,6 +1017,7 @@ def test_st40i_redundant_split_gap(
     Redundant ST40i split-mode with TX seq-gap injection to probe RX redundancy.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF"), count=4
     )
@@ -1063,12 +1118,15 @@ def test_st40i_redundant_split_gap(
                 host=host,
                 tx_first=False,
                 sleep_interval=4,
+                # tx-test-pkt-count pads the gap frames: the output outgrows the input.
+                skip_file_compare=True,
                 log_frame_info=True,
             )
             info_dump = run(f"cat {frame_info_path}", host=host)
             assert info_dump.return_code == 0
             entries = _parse_frame_info_entries(info_dump.stdout_text or "")
             _assert_redundant_frame_info(entries)
+            _assert_seq_gaps_healed(entries)
     finally:
         media_create.remove_file(input_file_path, host=host)
         media_create.remove_file(output_file_path, host=host)
@@ -1078,7 +1136,8 @@ def test_st40i_redundant_split_gap(
 @pytest.mark.nightly
 @pytest.mark.parametrize("fps", [60])
 @pytest.mark.parametrize("file_size_kb", [100])
-@pytest.mark.parametrize("framebuff", [1, 3, 6, 12])
+# st40 RX FRAME_LEVEL takes at least 2 buffers (rx_ancillary_ops_check).
+@pytest.mark.parametrize("framebuff", [2, 3, 6, 12])
 def test_st40p_framebuff(
     hosts,
     mtl_path,
@@ -1190,7 +1249,8 @@ def test_st40p_framebuff(
 
 @pytest.mark.nightly
 @pytest.mark.parametrize("fps", [24, 25, 30, 50, 60, 100, 120])
-@pytest.mark.parametrize("framebuff", [1, 3, 6, 12])
+# st40 RX FRAME_LEVEL takes at least 2 buffers (rx_ancillary_ops_check).
+@pytest.mark.parametrize("framebuff", [2, 3, 6, 12])
 def test_st40p_format_8331(
     hosts,
     mtl_path,
@@ -1613,9 +1673,11 @@ def test_st40p_interlace_auto_detect_reset(
     .. rubric:: Pass Criteria
     - Pipeline succeeds with TX interlaced and RX auto-detect enabled.
     - Payload round-trips without timeout using default frame-info logging.
+    - After the injected seq gap, RX logs the discontinuity and keeps delivering.
     """
 
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )
@@ -1719,6 +1781,9 @@ def test_st40p_interlace_auto_detect_reset(
                 host=host,
                 tx_first=False,
                 sleep_interval=5,
+                # tx-test-pkt-count pads the gap frame with repeated ANC packets, so the
+                # output outgrows the input; the clean run above compares the bytes.
+                skip_file_compare=True,
                 log_frame_info=True,
             )
 
@@ -1730,6 +1795,9 @@ def test_st40p_interlace_auto_detect_reset(
             assert any(
                 entry.get("seq_discont", 0) > 0 for entry in gap_entries
             ), "Seq-gap auto-detect reset did not log any discontinuity after gap"
+            assert not gap_entries[-1].get(
+                "seq_discont", 0
+            ), "RX delivered no clean frame after the seq gap"
     finally:
         media_create.remove_file(input_file_path, host=host)
         media_create.remove_file(output_file_path, host=host)
@@ -2030,6 +2098,7 @@ def test_st40p_split_mode_pacing_respected(
     :param media_file: Fixture providing input/output media paths.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path, libmtl=False)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )
@@ -2158,6 +2227,7 @@ def test_st40p_rx_missing_marker_no_ready(
     :param media_file: Fixture providing input/output media paths.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )
@@ -2258,6 +2328,7 @@ def test_st40p_rx_seq_loss_logged(
     :param media_file: Fixture providing input/output media paths.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )
@@ -2384,6 +2455,7 @@ def test_st40p_rx_bad_parity_drops_payload(
     :param media_file: Fixture providing input/output media paths.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )
@@ -2495,6 +2567,7 @@ def test_st40p_rx_multi_packet_field_accumulates(
     :param media_file: Fixture providing input/output media paths.
     """
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path, libmtl=False)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )
@@ -2587,6 +2660,7 @@ def test_st40p_split_padding_alignment_boundary(
     """
 
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path, libmtl=False)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )
@@ -2684,6 +2758,7 @@ def test_st40p_split_tx_mtu_guard_no_stall(
     """
 
     host = list(hosts.values())[0]
+    _skip_without_tx_test_hooks(host, mtl_path, libmtl=False)
     interfaces_list = setup_interfaces.get_interfaces_list_single(
         test_config.get("interface_type", "VF")
     )

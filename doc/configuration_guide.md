@@ -57,18 +57,17 @@ Example `tx_1v_1a_1anc.json` file, find more examples config files in [example c
                     "ancillary_format": "closed_caption",
                     "ancillary_url": "./test.txt",
                     "ancillary_fps": "p59"
-                }
-            ],
-            "fastmetadata": [
+                },
                 {
                     "replicas": 1,
-                    "start_port": 40000,
+                    "start_port": 40100,
                     "payload_type": 115,
                     "type": "frame",
+                    "fast_metadata": true,
                     "fastmetadata_data_item_type": 123456,
                     "fastmetadata_k_bit": 1,
-                    "fastmetadata_url": "./test.txt",
-                    "fastmetadata_fps": "p59"
+                    "ancillary_url": "./test.txt",
+                    "ancillary_fps": "p59"
                 }
             ]
         }
@@ -97,7 +96,7 @@ List all interfaces that can be used by app
  **rx_queues_cnt (int):** the number of tx queues(optional). Default it will calculated based on the sessions number in this configuration.
 
 > Session group contains a group of sessions which use some common settings, there can be 0 or multiple video/audio/ancillary sessions in one group, and there can be 0 or multiple tx/rx session groups in the following parts in case you have multiple destination IP.
-> See [tx_multi_dest](../config/test_tx_1port_2v_2dest.json) and [rx_multi_dest](../config/test_rx_1port_2v_2dest.json) for multiple destination reference.
+> See [tx_multi_dest](../config/tx_2v2dest_1a_1anc.json) and [rx_multi_dest](../config/rx_2v2dest_1a_1anc.json) for multiple destination reference.
 
 ### TX Sessions (array of tx session groups)
 
@@ -169,25 +168,11 @@ Items in each element of the "ancillary" array
 
 ​ **ancillary_fps (string):** `"p59", "p50", "p29"` ancillary fps which should be aligned to video
 
-#### fast metadata (array of fast metadata sessions)
+​ **fast_metadata (bool):** send SMPTE ST 2110-41 fast metadata instead of RFC 8331 ANC, (optional). Each frame carries one data item cut from `ancillary_url`; `ancillary_format` is ignored. `payload_type` must be `96~127`; omit it for the 115 default.
 
-Items in each element of the "fastmetadata" array
+​ **fastmetadata_data_item_type (int):** `0~4194303`  (0x - 0x3fffff) 22 bits data item type, used with `fast_metadata`. The reserved `0x300000~0x3fefff` makes the TX session fail to create.
 
-​ **replicas (int):** `1~max_num` the number of session copies
-
-​ **type (string):** `"frame", "rtp"` app->lib data type
-
-​ **start_port (int):** `0~65535` start udp port for copies of sessions
-
-​ **payload_type (int):** `0~127` 7 bits payload type define in RFC3550
-
-​ **fastmetadata_data_item_type (int):** `0~4194303`  (0x - 0x3fffff) 22 bits data item type
-
-​ **fastmetadata_k_bit (int):** `0~1` 1 bit K-bit value
-
-​ **fastmetadata_url (string):** fast metadata source
-
- **fastmetadata_fps (string):** `"p59", "p50", "p29"` fast metadata fps which should be aligned to video
+​ **fastmetadata_k_bit (int):** `0~1` 1 bit K-bit value, used with `fast_metadata`
 
 ### RX Sessions (array of rx session groups)
 
@@ -195,7 +180,7 @@ Common settings for following sessions in the group:
 
 ​ **ip (array-string):** the transmitter's IP or the multicast group IP, at least 1 primary IP, the second is redundant IP
 
-​ **mcast_src_ip (array-string):** the source IP filter for multicast(optional), assume primary and redundant sessions use different multicast group, if one of the source filter set, another is allowed to be set as 0.0.0.0(any source)
+​ **mcast_src_ip (array-string):** the source IP filter for multicast(optional), if one of the source filter set, another is allowed to be set as 0.0.0.0(any source). The primary and redundant ports may join the same multicast group; the source filter goes only into the IGMPv3 report, so the network must deliver each source to its own port
 
 ​ **interfaces (array-int):** interfaces/ports used by the sessions, at least 1 primary interface, the second is redundant interface
 
@@ -254,21 +239,13 @@ Items in each element of the "ancillary" array
 
 ​ **payload_type (int):** `0~127` 7 bits payload type define in RFC3550
 
-#### fast metadata (array of fast metadata sessions) for RX
+​ **fast_metadata (bool):** receive SMPTE ST 2110-41 fast metadata instead of RFC 8331 ANC, (optional). A packet counts as invalid unless its marker bit is 0, its RTP version is 2, its data item length is not 0 and it is at most 1452 bytes. A 12-byte zero-item packet is valid but is no frame; the session fails if valid packets, zero-item ones included, stop for more than 500 ms.
 
-Items in each element of the "fastmetadata" array
+​ **fastmetadata_data_item_type (int):** `0~4194303`  (0x - 0x3fffff) 22 bits data item type - reference value (for testing the flow) - Optional setting, used with `fast_metadata`
 
-​ **replicas (int):** `1~max_num` the number of session copies
+​ **fastmetadata_k_bit (int):** `0~1` 1 bit K-bit value - reference value (for testing the flow) - Optional setting, used with `fast_metadata`
 
-​ **start_port (int):** `0~65535` start udp port for copies of sessions
-
-​ **payload_type (int):** `0~127` 7 bits payload type define in RFC3550
-
-​ **fastmetadata_data_item_type (int):** `0~4194303`  (0x - 0x3fffff) 22 bits data item type - reference value (for testing the flow) - Optional setting
-
-​ **fastmetadata_k_bit (int):** `0~1` 1 bit K-bit value - reference value (for testing the flow) - Optional setting
-
-​ **fastmetadata_url (string):** fast metadata reference file (for testing the flow) - Optional setting
+​ **ancillary_url (string):** fast metadata reference file (for testing the flow) - Optional setting, used with `fast_metadata`
 
 ### Others
 

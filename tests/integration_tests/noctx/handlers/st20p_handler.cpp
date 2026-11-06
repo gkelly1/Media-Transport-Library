@@ -12,36 +12,10 @@
 #include <stdexcept>
 #include <thread>
 
-St20pHandler::St20pHandler(st_tests_context* ctx, FrameTestStrategy* frameTestStrategy,
-                           st20p_tx_ops ops_tx, st20p_rx_ops ops_rx, bool create,
-                           bool start)
-    : PipelineHandlerBase(ctx, frameTestStrategy, st20p_tx_create, st20p_rx_create,
-                          st20p_tx_free, st20p_rx_free),
-      nsFrameTime(0) {
-  if (ops_tx.name == nullptr && ops_rx.name == nullptr) {
-    fillSt20Ops();
-    ops_tx = sessionsOpsTx;
-    ops_rx = sessionsOpsRx;
-  } else {
-    sessionsOpsTx = ops_tx;
-    sessionsOpsRx = ops_rx;
-  }
-
-  EXPECT_TRUE(frameTestStrategy != nullptr);
-  if (!frameTestStrategy) return;
-
-  setFrameTestStrategy(frameTestStrategy);
-
-  if (create) {
-    createSession(ops_tx, ops_rx, start);
-  }
-}
-
 St20pHandler::St20pHandler(st_tests_context* ctx, st20p_tx_ops ops_tx,
                            st20p_rx_ops ops_rx)
     : PipelineHandlerBase(ctx, nullptr, st20p_tx_create, st20p_rx_create, st20p_tx_free,
-                          st20p_rx_free),
-      nsFrameTime(0) {
+                          st20p_rx_free) {
   if (ops_tx.name == nullptr && ops_rx.name == nullptr) {
     fillSt20Ops();
   } else {
@@ -100,26 +74,6 @@ void St20pHandler::fillSt20Ops(uint transmissionPort, uint framebufferQueueSize,
   sessionsOpsRx.output_fmt = (enum st_frame_fmt)fmt;
   sessionsOpsRx.interlaced = interlaced;
   sessionsOpsRx.framebuff_cnt = framebufferQueueSize;
-
-  normalizeSessionOps();
-}
-
-void St20pHandler::normalizeSessionOps() {
-  auto fpsToInteger = [](enum st_fps fps) {
-    return static_cast<uint64_t>(st_frame_rate(fps));
-  };
-
-  uint64_t frameRate = fpsToInteger(sessionsOpsTx.fps);
-  if (!frameRate) {
-    frameRate = fpsToInteger(sessionsOpsRx.fps);
-  }
-
-  if (!frameRate) {
-    nsFrameTime = NS_PER_S / 25;
-    return;
-  }
-
-  nsFrameTime = NS_PER_S / frameRate;
 }
 
 void St20pHandler::st20TxDefaultFunction(std::atomic<bool>& stopFlag) {

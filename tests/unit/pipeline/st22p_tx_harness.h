@@ -38,14 +38,55 @@ void ut22p_tx_ctx_destroy(ut22p_tx_ctx* ctx);
 
 int ut22p_tx_framebuff_cnt(const ut22p_tx_ctx* ctx);
 
+/**
+ * Turn on ST22P_TX_FLAG_BLOCK_GET behaviour for the app side: init the block
+ * cond/mutex and set the wait timeout of ut22p_tx_get_frame(). Call before
+ * any ut22p_tx_get_frame().
+ */
+void ut22p_tx_ctx_enable_blocking(ut22p_tx_ctx* ctx, uint64_t timeout_ns);
+
+/**
+ * Turn on ST22_ENCODER_RESP_FLAG_BLOCK_GET behaviour for the encoder-plugin
+ * side: init the encode block cond/mutex and set its wait timeout. Call before
+ * any ut22p_tx_encode_get_frame().
+ */
+void ut22p_tx_ctx_enable_encode_blocking(ut22p_tx_ctx* ctx, uint64_t timeout_ns);
+
+/** Switch to the encoder path with a no-op encoder device: put_frame leaves
+ *  the frame READY for ut22p_tx_encode_get_frame(). */
+void ut22p_tx_ctx_set_encoder(ut22p_tx_ctx* ctx);
+
+/** Set ctx->ready, as st22p_tx_create() does once the session is built. */
+void ut22p_tx_set_ready(ut22p_tx_ctx* ctx, bool ready);
+
+/** Wake a blocking get_frame sleeper (wraps st22p_tx_wake_block). */
+void ut22p_tx_wake_block(ut22p_tx_ctx* ctx);
+
+/** Wake a blocking encode_get_frame sleeper, via the callback the encoder
+ * device is registered with (wraps tx_st22p_encode_wake_block). */
+void ut22p_tx_encode_wake_block(ut22p_tx_ctx* ctx);
+
+/** The first two steps of st22p_tx_free(): begin_destroy, then wake_on_destroy.
+ *  That wakes both block conds, so enable both blockings first. */
+void ut22p_tx_begin_destroy(ut22p_tx_ctx* ctx);
+
+/* encoder-plugin side: claim READY->IN_ENCODING. Returns 0 when a frame was
+ * handed back, -EBUSY when none was. */
+int ut22p_tx_encode_get_frame(ut22p_tx_ctx* ctx);
+
 /** Set the mock PTP wall-clock time returned by mt_get_ptp_time(). */
 void ut22p_tx_set_ptp_ns(ut22p_tx_ctx* ctx, uint64_t ns);
 
 /** OR the given bits into ops.flags (e.g. ST22P_TX_FLAG_DROP_WHEN_LATE). */
 void ut22p_tx_set_flags(ut22p_tx_ctx* ctx, uint32_t flags);
 
-/** Set ops.fps, used by tx_st22p_if_frame_late() to derive the frame period. */
+/** Set ops.fps and the cached frame period tx_st22p_if_frame_late() reads. */
 void ut22p_tx_set_fps(ut22p_tx_ctx* ctx, enum st_fps fps);
+
+/** Cache the period of cached_fps as create() does, then point ops.fps at
+ * ops_fps. One call, so the two writes cannot be ordered the other way. */
+void ut22p_tx_set_fps_mismatch(ut22p_tx_ctx* ctx, enum st_fps cached_fps,
+                               enum st_fps ops_fps);
 
 /** Register ops.notify_frame_done. */
 void ut22p_tx_set_notify_frame_done(ut22p_tx_ctx* ctx,
@@ -74,6 +115,20 @@ int ut22p_tx_all_free(const ut22p_tx_ctx* ctx);
 
 /* Raw stat value of framebuffer i (for diagnostics). */
 int ut22p_tx_frame_stat(const ut22p_tx_ctx* ctx, int i);
+
+/**
+ * Run create_transport against a stub transport create, then fire the late
+ * callback it registered the way the transport session does. Returns the
+ * callback's return, or -ENOENT when no late callback was registered.
+ */
+int ut22p_tx_transport_report_late(ut22p_tx_ctx* ctx, uint64_t epoch_skipped);
+
+/**
+ * Call st22p_tx_create() on a bare instance with one port, named in
+ * ops->port.port[0] by this call. For create paths that fail before any
+ * transport or encoder is needed.
+ */
+st22p_tx_handle ut22p_tx_create(struct st22p_tx_ops* ops);
 
 #ifdef __cplusplus
 }

@@ -5,6 +5,7 @@
 #include "st_rx_audio_session.h"
 
 #include <math.h>
+#include <rte_random.h>
 
 #include "../datapath/mt_queue.h"
 #include "../mt_handle_guard.h"
@@ -109,6 +110,7 @@ static int rx_audio_session_free_frames(struct st_rx_audio_session_impl* s) {
   if (s->frame_bitmap) {
     mt_rte_free(s->frame_bitmap);
     s->frame_bitmap = NULL;
+    s->frame_bitmap_size = 0;
   }
 
   dbg("%s(%d), succ\n", __func__, s->idx);
@@ -149,12 +151,14 @@ static int rx_audio_session_alloc_frames(struct st_rx_audio_session_impl* s) {
     st30_frame->iova = rte_malloc_virt2iova(frame);
   }
 
-  s->frame_bitmap = mt_rte_zmalloc_socket(((size_t)s->st30_total_pkts + 7) / 8, soc_id);
+  size_t bitmap_size = ((size_t)s->st30_total_pkts + 7) / 8;
+  s->frame_bitmap = mt_rte_zmalloc_socket(bitmap_size, soc_id);
   if (!s->frame_bitmap) {
     err("%s(%d), frame_bitmap alloc fail\n", __func__, idx);
     rx_audio_session_free_frames(s);
     return -ENOMEM;
   }
+  s->frame_bitmap_size = bitmap_size;
 
   dbg("%s(%d), succ\n", __func__, idx);
   return 0;
@@ -269,15 +273,15 @@ static int rx_audio_session_open_frame(struct st_rx_audio_session_impl* s,
     return -EIO;
   }
 
-  /* Anchor on the grid floor carried by s->tmstamp so a missing leading packet
-   * leaves slot 0 unset; resync to the arriving ts on a jump beyond one frame. */
-  uint32_t spp = s->samples_per_pkt ? s->samples_per_pkt : 1;
+  /* Floor onto the grid s->tmstamp carries so frame boundaries never move. Signed:
+   * the redundancy filter can force-accept a packet from behind the floor. */
+  int64_t ticks = s->rtp_ticks_per_frame ? s->rtp_ticks_per_frame : 1;
   uint32_t grid_base = (uint32_t)(s->tmstamp + 1);
-  uint32_t base = (((uint32_t)(tmstamp - grid_base) / spp) < (uint32_t)s->st30_total_pkts)
-                      ? grid_base
-                      : tmstamp;
+  int32_t delta = (int32_t)(tmstamp - grid_base);
+  int64_t frames = delta / ticks - (delta % ticks < 0); /* floor, not truncate */
+  uint32_t base = grid_base + (uint32_t)(frames * ticks);
 
-  memset(s->frame_bitmap, 0, ((size_t)s->st30_total_pkts + 7) / 8);
+  memset(s->frame_bitmap, 0, s->frame_bitmap_size);
   s->frame_recv_size = 0;
   s->first_pkt_rtp_ts = base;
   s->first_pkt_ptp_ts = ptp_ts;
@@ -286,10 +290,18 @@ static int rx_audio_session_open_frame(struct st_rx_audio_session_impl* s,
   return 0;
 }
 
-/* Close the open frame: COMPLETE when every positional slot was filled,
- * CORRUPTED otherwise (mirrors st20 rv_frame_notify). The floor watermark is
- * advanced to the next frame so a late packet for this just-closed frame is
- * dropped by the redundancy filter. */
+/* Zero the slots that never arrived; the recycled buffer still holds older audio. */
+static void rx_audio_session_zero_frame_gaps(struct st_rx_audio_session_impl* s,
+                                             struct st_frame_trans* frame) {
+  for (int i = 0; i < s->st30_total_pkts; i++) {
+    if (mt_bitmap_test(s->frame_bitmap, s->frame_bitmap_size, i)) continue;
+    memset((uint8_t*)frame->addr + (size_t)i * s->pkt_len, 0, s->pkt_len);
+  }
+}
+
+/* Close the open frame: COMPLETE when every slot was filled, else CORRUPTED and
+ * discarded unless the app opted in -- the discard policy of st20 rv_frame_notify.
+ * The floor advances a frame, so a late packet for it is dropped as redundant. */
 static void rx_audio_session_frame_notify(struct mtl_main_impl* impl,
                                           struct st_rx_audio_session_impl* s) {
   struct st30_rx_ops* ops = &s->ops;
@@ -321,8 +333,13 @@ static void rx_audio_session_frame_notify(struct mtl_main_impl* impl,
   meta->channel = ops->channel;
   meta->rtp_timestamp = s->first_pkt_rtp_ts;
   meta->frame_recv_size = s->frame_recv_size;
-  meta->status = (s->frame_recv_size >= s->st30_frame_size) ? ST_FRAME_STATUS_COMPLETE
-                                                            : ST_FRAME_STATUS_CORRUPTED;
+  bool incomplete = s->frame_recv_size < s->st30_frame_size;
+  bool deliver = !incomplete || (ops->flags & ST30_RX_FLAG_RECEIVE_INCOMPLETE_FRAME);
+  meta->status = incomplete ? ST_FRAME_STATUS_CORRUPTED : ST_FRAME_STATUS_COMPLETE;
+  if (incomplete) {
+    s->port_user_stats.stat_frames_incomplete++;
+    rx_audio_session_zero_frame_gaps(s, frame);
+  }
 
   MT_USDT_ST30_RX_FRAME_AVAILABLE(s->mgr->idx, s->idx, frame->idx, frame->addr,
                                   s->first_pkt_rtp_ts, meta->frame_recv_size);
@@ -332,20 +349,24 @@ static void rx_audio_session_frame_notify(struct mtl_main_impl* impl,
     rx_audio_session_usdt_dump_close(s);
   }
 
-  bool time_measure = mt_sessions_time_measure(impl);
-  if (time_measure) tsc_start = mt_get_tsc(impl);
-  int ret = ops->notify_frame_ready(ops->priv, frame->addr, meta);
-  if (time_measure) {
-    uint32_t delta_us = (mt_get_tsc(impl) - tsc_start) / NS_PER_US;
-    s->stat_max_notify_frame_us = RTE_MAX(s->stat_max_notify_frame_us, delta_us);
-  }
-  if (ret < 0) {
-    warn("%s(%d), notify_frame_ready return fail %d\n", __func__, s->idx, ret);
+  if (!deliver) {
     rx_audio_session_put_frame(s, frame);
+  } else {
+    if (!incomplete) rte_atomic32_inc(&s->stat_frames_received);
+    bool time_measure = mt_sessions_time_measure(impl);
+    if (time_measure) tsc_start = mt_get_tsc(impl);
+    int ret = ops->notify_frame_ready(ops->priv, frame->addr, meta);
+    if (time_measure) {
+      uint32_t delta_us = (mt_get_tsc(impl) - tsc_start) / NS_PER_US;
+      s->stat_max_notify_frame_us = RTE_MAX(s->stat_max_notify_frame_us, delta_us);
+    }
+    if (ret < 0) {
+      warn("%s(%d), notify_frame_ready return fail %d\n", __func__, s->idx, ret);
+      rx_audio_session_put_frame(s, frame);
+    }
   }
 
   s->tmstamp = (int64_t)(uint32_t)(s->first_pkt_rtp_ts + s->rtp_ticks_per_frame - 1);
-  rte_atomic32_inc(&s->stat_frames_received);
   s->st30_cur_frame = NULL;
 }
 
@@ -468,10 +489,7 @@ static int rx_audio_session_handle_frame_pkt(struct mtl_main_impl* impl,
   uint32_t idx = (tmstamp - s->first_pkt_rtp_ts) / spp;
 
   if (idx >= (uint32_t)s->st30_total_pkts) {
-    /* forward jump: close the open frame (CORRUPTED if partial), emit nothing
-     * for any wholly-missing frames in between, then open a fresh frame at this
-     * timestamp. A late packet for the just-closed frame is dropped — the
-     * single slot keeps no history of it. */
+    /* not the open frame: ahead of it, or (unsigned underflow) behind it */
     rx_audio_session_frame_notify(impl, s);
     if (rx_audio_session_open_frame(s, s_port, tmstamp,
                                     mt_mbuf_time_stamp(impl, mbuf, port)) < 0) {
@@ -482,14 +500,14 @@ static int rx_audio_session_handle_frame_pkt(struct mtl_main_impl* impl,
     idx = (tmstamp - s->first_pkt_rtp_ts) / spp;
   }
 
-  if (mt_bitmap_test_and_set(s->frame_bitmap, (int)idx)) {
+  if (mt_bitmap_test_and_set(s->frame_bitmap, s->frame_bitmap_size, (int)idx)) {
     dbg("%s(%d,%d), seq %d idx %u already received\n", __func__, s->idx, s_port, seq_id,
         idx);
     s->port_user_stats.common.stat_pkts_redundant++;
     return 0;
   }
 
-  rte_memcpy(s->st30_cur_frame->addr + (size_t)idx * s->pkt_len, payload, s->pkt_len);
+  mt_memcpy(s->st30_cur_frame->addr + (size_t)idx * s->pkt_len, payload, s->pkt_len);
   s->frame_recv_size += s->pkt_len;
   s->port_user_stats.common.stat_pkts_received++;
 
@@ -709,8 +727,8 @@ static int ra_dump_pcap(struct st_rx_audio_session_impl* s, struct rte_mbuf** mb
 
 static bool ra_simulate_pkt_loss(struct st_rx_audio_session_impl* s) {
   if (s->burst_loss_cnt == 0) {
-    if (((float)rand() / (float)RAND_MAX) < s->sim_loss_rate) {
-      s->burst_loss_cnt = rand() % s->burst_loss_max + 1;
+    if (rte_drand() < s->sim_loss_rate) {
+      s->burst_loss_cnt = (uint16_t)(rte_rand_max(s->burst_loss_max) + 1);
     } else {
       return false;
     }
@@ -852,11 +870,11 @@ static int rx_audio_session_init_hw(struct mtl_main_impl* impl,
     s->priv[i].s_port = i;
 
     memset(&flow, 0, sizeof(flow));
-    rte_memcpy(flow.dip_addr, s->ops.ip_addr[i], MTL_IP_ADDR_LEN);
+    mt_memcpy(flow.dip_addr, s->ops.ip_addr[i], MTL_IP_ADDR_LEN);
     if (mt_is_multicast_ip(flow.dip_addr))
-      rte_memcpy(flow.sip_addr, s->ops.mcast_sip_addr[i], MTL_IP_ADDR_LEN);
+      mt_memcpy(flow.sip_addr, s->ops.mcast_sip_addr[i], MTL_IP_ADDR_LEN);
     else
-      rte_memcpy(flow.sip_addr, mt_sip_addr(impl, port), MTL_IP_ADDR_LEN);
+      mt_memcpy(flow.sip_addr, mt_sip_addr(impl, port), MTL_IP_ADDR_LEN);
     flow.dst_port = s->st30_dst_port[i];
     if (mt_has_cni_rx(impl, port)) flow.flags |= MT_RXQ_FLOW_F_FORCE_CNI;
 
@@ -1098,6 +1116,7 @@ static void rx_audio_session_stat(struct st_rx_audio_sessions_mgr* mgr,
       us->stat_pkts_len_mismatch_dropped - snap->stat_pkts_len_mismatch_dropped;
   uint64_t slot_get_frame_fail =
       us->stat_slot_get_frame_fail - snap->stat_slot_get_frame_fail;
+  uint64_t frames_incomplete = us->stat_frames_incomplete - snap->stat_frames_incomplete;
 
   if (pkts_redundant) {
     notice("RX_AUDIO_SESSION(%d,%d:%s): fps %f frames %d pkts %" PRIu64
@@ -1159,6 +1178,10 @@ static void rx_audio_session_stat(struct st_rx_audio_sessions_mgr* mgr,
         pkts_unrecovered);
   }
 
+  if (frames_incomplete) {
+    notice("RX_AUDIO_SESSION(%d,%d): incomplete frames %" PRIu64 "\n", m_idx, idx,
+           frames_incomplete);
+  }
   if (pkts_dropped) {
     notice("RX_AUDIO_SESSION(%d,%d): dropped pkts %" PRIu64 "\n", m_idx, idx,
            pkts_dropped);
@@ -1472,9 +1495,9 @@ static int rx_audio_ops_prune_down_ports(struct mtl_main_impl* impl,
 
     /* shift all further port names one slot down */
     for (int j = i; j < num_ports - 1; j++) {
-      rte_memcpy(ops->port[j], ops->port[j + 1], MTL_PORT_MAX_LEN);
-      rte_memcpy(ops->ip_addr[j], ops->ip_addr[j + 1], MTL_IP_ADDR_LEN);
-      rte_memcpy(ops->mcast_sip_addr[j], ops->mcast_sip_addr[j + 1], MTL_IP_ADDR_LEN);
+      mt_memcpy(ops->port[j], ops->port[j + 1], MTL_PORT_MAX_LEN);
+      mt_memcpy(ops->ip_addr[j], ops->ip_addr[j + 1], MTL_IP_ADDR_LEN);
+      mt_memcpy(ops->mcast_sip_addr[j], ops->mcast_sip_addr[j + 1], MTL_IP_ADDR_LEN);
       ops->udp_port[j] = ops->udp_port[j + 1];
     }
 
@@ -1514,7 +1537,7 @@ static int rx_audio_ops_check(struct st30_rx_ops* ops) {
     }
   }
 
-  if (num_ports > 1) {
+  if (num_ports > 1 && !mt_is_multicast_ip(ops->ip_addr[0])) {
     if (0 == memcmp(ops->ip_addr[0], ops->ip_addr[1], MTL_IP_ADDR_LEN)) {
       err("%s, same %d.%d.%d.%d for both ip\n", __func__, ip[0], ip[1], ip[2], ip[3]);
       return -EINVAL;

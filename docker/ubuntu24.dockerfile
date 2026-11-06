@@ -4,8 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Ubuntu 24.04 with eBPF/XDP support
-ARG IMAGE_CACHE_REGISTRY=docker.io
-FROM "${IMAGE_CACHE_REGISTRY}/library/ubuntu:24.04" AS builder
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS builder
 
 LABEL maintainer="andrzej.wilczynski@intel.com,dawid.wesierski@intel.com,marek.kasiewicz@intel.com"
 
@@ -43,17 +42,16 @@ RUN ./build_ebpf_xdp.sh
 WORKDIR "${MTL_REPO}/script"
 RUN ./build_dpdk.sh -f
 
-# Build MTL
+# Run the unit suite, then build MTL
 WORKDIR "${MTL_REPO}"
-RUN ./build.sh && \
+RUN ./build.sh unit && \
+    ./build.sh && \
     ninja -C build install && \
     DESTDIR=/install ninja -C build install && \
     setcap 'cap_net_raw+ep' tests/tools/RxTxApp/build/RxTxApp
 
 # Ubuntu 24.04, runtime/final stage
-ARG MTL_REPO
-ARG IMAGE_CACHE_REGISTRY
-FROM "${IMAGE_CACHE_REGISTRY}/library/ubuntu:24.04" AS final
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS final
 
 LABEL org.opencontainers.image.authors="andrzej.wilczynski@intel.com,dawid.wesierski@intel.com,marek.kasiewicz@intel.com"
 LABEL org.opencontainers.image.url="https://github.com/OpenVisualCloud/Media-Transport-Library"
@@ -74,8 +72,9 @@ SHELL ["/bin/bash", "-ex", "-o", "pipefail", "-c"]
 WORKDIR /home/imtl/
 RUN apt-get clean -y && rm -rf /var/lib/apt/lists/* && \
     apt-get update -y && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends ca-certificates sudo curl unzip && \
-    apt-get install -y --no-install-recommends libnuma1 libjson-c5 libpcap0.8t64 libsdl2-2.0-0 libsdl2-ttf-2.0-0 libssl3t64 zlib1g libelf1t64 libcap-ng0 libatomic1 && \
+    apt-get install -y --no-install-recommends libnuma1 libjson-c5 libpcap0.8t64 libsdl2-2.0-0 libsdl2-ttf-2.0-0 libssl3t64 zlib1g libelf1t64 libcap-ng0 libatomic1 pciutils && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
@@ -84,10 +83,13 @@ RUN apt-get clean -y && rm -rf /var/lib/apt/lists/* && \
     useradd -m -G vfio,root,sudo -u 20001 imtl
 
 # Copy libraries and binaries
+COPY --from=builder /usr/local/lib/x86_64-linux-gnu/* /usr/local/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/local/bin/* /usr/local/bin/
 COPY --chown=imtl --from=builder /install /
 COPY --chown=imtl --from=builder "${MTL_REPO}/build" "/home/imtl"
 COPY --chown=imtl --from=builder "${MTL_REPO}/tests/tools/RxTxApp/build/RxTxApp" "/home/imtl/RxTxApp"
 COPY --chown=imtl --from=builder "${MTL_REPO}/tests/tools/RxTxApp/script" "/home/imtl/scripts"
+COPY --chown=imtl --from=builder "${MTL_REPO}/script" "/home/imtl/script"
 
 RUN ldconfig
 SHELL ["/bin/bash", "-c"]

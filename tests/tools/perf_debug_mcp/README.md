@@ -35,9 +35,8 @@ automatically:
 
 ### MTL USDT integration
 
-The 8 USDT tracing tools attach directly to MTL's 82 built-in USDT probes
-(11 providers: sys, ptp, st20, st20p, st22, st22p, st30, st30p, st40, st40p,
-st41). USDT is the preferred data source — zero overhead when not attached,
+The 8 USDT tracing tools attach directly to MTL's 78 built-in USDT probes
+(10 providers: sys, ptp, st20, st20p, st22, st22p, st30, st30p, st40, st40p). USDT is the preferred data source — zero overhead when not attached,
 real-time introspection when active:
 
 | Tool | What it measures |
@@ -59,7 +58,7 @@ real-time introspection when active:
 
 | Requirement | Version | Notes |
 | ------------- | --------- | ------- |
-| Node.js | >= 18 | Runtime |
+| Node.js | ^22.23.4, ^24.22.1 or >= 26.12.1 | Runtime; older releases lack the fix for CVE-2026-111497 |
 | Linux kernel | >= 4.18 | cgroup v2 for cgroup tools |
 | `bpftrace` | *(optional)* | USDT tracing tools (8 tools) |
 | `bpfcc-tools` | *(optional)* | BCC tracing tools (19 tools) |
@@ -410,7 +409,7 @@ npm test    # 224 tests (unit, integration, PCM, MTL)
 | TypeScript | ^5.4 (strict, ECMAScript 2022, Node16 ESM) |
 | MCP SDK | `@modelcontextprotocol/sdk` ^1.12.1 |
 | Testing | Jest 29 + ts-jest (ESM) |
-| Runtime | Node.js >= 18 |
+| Runtime | Node.js ^22.23.4, ^24.22.1 or >= 26.12.1 |
 | Native | Rust (optional) — `libbpf-rs`, `serde`, `clap` |
 
 ## License

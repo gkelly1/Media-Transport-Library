@@ -21,8 +21,10 @@ DMA_DEVICE_IDS = {
     "8086:0b00": "Intel CBDMA (QuickData Technology)",
 }
 
+DSA_DEVICE_ID = "8086:0b25"
+
 # Default device ID to search for (DSA first, then CBDMA as fallback)
-DEFAULT_DMA_DEVICE_IDS = ["8086:0b25", "8086:0b00"]
+DEFAULT_DMA_DEVICE_IDS = [DSA_DEVICE_ID, "8086:0b00"]
 
 # PCI address pattern: domain:bus:device.function (e.g., 0000:6a:01.0)
 PCI_ADDRESS_PATTERN = re.compile(
@@ -271,6 +273,21 @@ def _prepare_idxd_for_unbind(host) -> bool:
     return modules_removed
 
 
+def _current_driver(host, pci_address: str) -> str:
+    """Return the driver bound to *pci_address*, or ``"none"``.
+
+    The kernel is the authority on who owns a PCI device, and that is what decides
+    whether DPDK can claim it.
+    """
+    result = host.connection.execute_command(
+        f"basename $(readlink /sys/bus/pci/devices/{pci_address}/driver "
+        f"2>/dev/null) 2>/dev/null || echo none",
+        shell=True,
+        timeout=10,
+    )
+    return result.stdout.strip() if result and result.stdout else "none"
+
+
 def _sysfs_bind_vfio(host, pci_address: str) -> bool:
     """Bind a PCI device to vfio-pci via sysfs (bypass dpdk-devbind.py).
 
@@ -280,14 +297,7 @@ def _sysfs_bind_vfio(host, pci_address: str) -> bool:
 
     Returns True if the device is successfully bound to vfio-pci.
     """
-    # Check current driver first
-    result = host.connection.execute_command(
-        f"basename $(readlink /sys/bus/pci/devices/{pci_address}/driver "
-        f"2>/dev/null) 2>/dev/null || echo none",
-        shell=True,
-        timeout=10,
-    )
-    current_drv = result.stdout.strip() if result and result.stdout else "none"
+    current_drv = _current_driver(host, pci_address)
 
     if current_drv == "vfio-pci":
         return True
@@ -327,13 +337,7 @@ def _sysfs_bind_vfio(host, pci_address: str) -> bool:
     )
 
     # Verify
-    result = host.connection.execute_command(
-        f"basename $(readlink /sys/bus/pci/devices/{pci_address}/driver 2>/dev/null) "
-        f"2>/dev/null || echo none",
-        shell=True,
-        timeout=10,
-    )
-    drv = result.stdout.strip() if result and result.stdout else "none"
+    drv = _current_driver(host, pci_address)
     if drv == "vfio-pci":
         return True
 
@@ -352,15 +356,7 @@ def bind_dma_to_vfio(host, pci_address: str) -> bool:
         host.connection.execute_command("sudo modprobe vfio-pci", shell=True)
 
         # Check if already bound to vfio-pci
-        result = host.connection.execute_command(
-            f"sudo dpdk-devbind.py --status-dev dma 2>/dev/null"
-            f" | grep '{pci_address}' || true",
-            shell=True,
-            timeout=10,
-        )
-        current_status = result.stdout.strip() if result and result.stdout else ""
-
-        if "drv=vfio-pci" not in current_status:
+        if _current_driver(host, pci_address) != "vfio-pci":
             logger.info(f"Binding DMA {pci_address} to vfio-pci on {host.name}")
 
             # Prepare idxd subsystem once per host: disable workqueues, rmmod,
@@ -383,17 +379,11 @@ def bind_dma_to_vfio(host, pci_address: str) -> bool:
                 )
 
         # Verify the bind succeeded
-        result = host.connection.execute_command(
-            f"sudo dpdk-devbind.py --status-dev dma 2>/dev/null"
-            f" | grep '{pci_address}' || true",
-            shell=True,
-            timeout=10,
-        )
-        bind_status = result.stdout.strip() if result and result.stdout else ""
-        if "drv=vfio-pci" not in bind_status:
+        bound_drv = _current_driver(host, pci_address)
+        if bound_drv != "vfio-pci":
             logger.error(
                 f"Failed to bind DMA {pci_address} to vfio-pci "
-                f"on {host.name}: {bind_status or 'not found'}"
+                f"on {host.name}: driver={bound_drv}"
             )
             return False
 
@@ -424,7 +414,6 @@ def bind_dma_to_vfio(host, pci_address: str) -> bool:
             )
             return False
 
-        logger.info(f"DMA {pci_address} on {host.name}: {bind_status}")
         logger.info(
             f"DMA {pci_address} bound to vfio-pci on {host.name} "
             f"(IOMMU group viable)"

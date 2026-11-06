@@ -34,6 +34,29 @@ def parse_fps_to_pformat(fps_field: Union[str, int]) -> str:
     return f"p{fps_val}"
 
 
+# The four rates whose pXX label truncates, by the NTSC convention above: p23 is
+# 23.98, p29 is 29.97, p59 is 59.94, p119 is 119.88. Every other label is exact.
+_TRUNCATED_FPS_LABELS = frozenset({23, 29, 59, 119})
+
+
+def pformat_to_exact_fps(fps_field: Union[str, int]) -> str:
+    """Inverse of :func:`parse_fps_to_pformat`: the rate a pXX label stands for.
+
+    Returned as an FFmpeg rational ('30000/1001'), exact rather than rounded.
+
+    A label is not a rate. MTL resolves a rate to whichever ST 2110 rate's
+    tolerance window it falls in and paces at *that*, so anything setting a real
+    FFmpeg rate -- ``-framerate`` on a demuxer, the ``fps`` filter -- has to be
+    given the rate. Handing it the label instead leaves a producer running ~1
+    frame/s slower than MTL paces, which starves the pacer into dropping one
+    frame every second (``TX_VIDEO_SESSION ... epoch drop``).
+    """
+    fps_val = int(str(fps_field).lstrip("pi"))
+    if fps_val in _TRUNCATED_FPS_LABELS:
+        return f"{(fps_val + 1) * 1000}/1001"
+    return str(fps_val)
+
+
 yuv_files = dict(
     i720p23={
         "filename": "HDR_BBC_v4_008_Penguin1_1280x720_10bit_25Hz_P422_180frames.yuv",
@@ -392,6 +415,21 @@ yuv_files_422p10le = dict(
     },
 )
 
+# 4K sibling of the yuv_files_422p10le entries, held apart from that dict on
+# purpose: st20p/test_format_conversion.py and st22p/test_format.py both
+# parametrize over every value in it, and neither sweep is meant to grow a 4K
+# case -- least of all a 4K JPEG-XS one.
+yuv_files_422p10le_4k = dict(
+    Penguin_4K={
+        "filename": "HDR_BBC_v4_008_Penguin1_3840x2160_10bit_25Hz_P422_180frames.yuv",
+        "file_format": "YUV422PLANAR10LE",
+        "format": "YUV_422_10bit",
+        "fps": "25",
+        "width": 3840,
+        "height": 2160,
+    },
+)
+
 # st20p input (source) pixel-format sweep assets, keyed by the FFmpeg
 # AVPixelFormat name.  Every entry is a pre-generated 1080p25 raw file that
 # lives on the media share -- tests must never transcode at runtime.
@@ -475,6 +513,31 @@ yuv_files_input_formats = {
     },
 }
 
+# The two input formats the mtl_st20p_tx caps accept (v210, I422_10LE). v210
+# has no AVPixelFormat, so it is a GStreamer-only row.
+yuv_files_gstreamer_input_formats = {
+    "yuv422p10le": yuv_files_input_formats["yuv422p10le"],
+    "v210": {
+        "filename": "gstreamer_v210_1920x1080_60hz.yuv",
+        "file_format": "v210",
+        "format": "YUV_422_10bit",
+        "fps": "60",
+        "width": 1920,
+        "height": 1080,
+    },
+}
+
+# The yuv_files_input_formats footage the JPEG XS encoder takes besides yuv422p10le.
+# The I420 file is YUV420PLANAR8 here; st20p passes it through as YUV420CUSTOM8.
+yuv_files_st22p_input_formats = {
+    key: yuv_files_input_formats[key]
+    for key in ("yuv422p12le", "yuv444p10le", "yuv444p12le", "gbrp10le", "gbrp12le")
+}
+yuv_files_st22p_input_formats["yuv420p"] = {
+    **yuv_files_input_formats["yuv420p"],
+    "file_format": "YUV420PLANAR8",
+}
+
 yuv_files_interlace = dict(
     Crosswalk_480p={
         "filename": "Netflix_Crosswalk_720x480_interlace_10bit_60Hz_P422.yuv",
@@ -510,6 +573,17 @@ yuv_files_interlace = dict(
     },
 )
 
+# yuv_files_interlace as planar, for the JPEG XS encoder, which takes planar input
+# only. Each file is its RFC 4175 twin, converted field by field.
+yuv_files_interlace_422p10le = {
+    key: {
+        **info,
+        "filename": info["filename"].replace(".yuv", "_yuv422p10le.yuv"),
+        "file_format": "YUV422PLANAR10LE",
+    }
+    for key, info in yuv_files_interlace.items()
+}
+
 yuv_files_422rfc10 = dict(
     Penguin_720p={
         "filename": "HDR_BBC_v4_008_Penguin1_1280x720_10bit_25Hz_P422_180frames.yuv",
@@ -537,6 +611,16 @@ yuv_files_422rfc10 = dict(
     },
     Penguin_8K={
         "filename": "HDR_BBC_v4_008_Penguin1_7680x4320_10bit_25Hz_P422_To_yuv422rfc4175be10_180frames.yuv",
+        "file_format": "YUV422RFC4175PG2BE10",
+        "format": "YUV_422_10bit",
+        "fps": "25",
+        "width": 7680,
+        "height": 4320,
+    },
+    # 24-frame prefix of Penguin_8K, for the capacity sweep. See PERF_SOURCE_FRAMES
+    # in tests/dual/performance/test_vf_perf_dualhost.py for why the sweep needs it.
+    Penguin_8K_24frames={
+        "filename": "HDR_BBC_v4_008_Penguin1_7680x4320_10bit_25Hz_P422_To_yuv422rfc4175be10_24frames.yuv",
         "file_format": "YUV422RFC4175PG2BE10",
         "format": "YUV_422_10bit",
         "fps": "25",
@@ -583,8 +667,24 @@ yuv_files_422rfc10 = dict(
         "width": 1920,
         "height": 1080,
     },
+    ParkJoy_1080p_24frames={
+        "filename": "ParkJoy_1920x1080_10bit_50Hz_P422_yuv422p10be_To_yuv422YCBCR10be_24frames.yuv",
+        "file_format": "YUV422RFC4175PG2BE10",
+        "format": "YUV_422_10bit",
+        "fps": "50",
+        "width": 1920,
+        "height": 1080,
+    },
     ParkJoy_4K={
         "filename": "ParkJoy_3840x2160_10bit_50Hz_P422_To_yuv422p10be_To_yuv422YCBCR10be.yuv",
+        "file_format": "YUV422RFC4175PG2BE10",
+        "format": "YUV_422_10bit",
+        "fps": "50",
+        "width": 3840,
+        "height": 2160,
+    },
+    ParkJoy_4K_24frames={
+        "filename": "ParkJoy_3840x2160_10bit_50Hz_P422_To_yuv422p10be_To_yuv422YCBCR10be_24frames.yuv",
         "file_format": "YUV422RFC4175PG2BE10",
         "format": "YUV_422_10bit",
         "fps": "50",
@@ -660,12 +760,6 @@ anc_files = dict(
     text_p59={
         "filename": "test.txt",
         "fps": "p59",
-    },
-)
-
-st41_files = dict(
-    st41_p29_long_file={
-        "filename": "st41_long_test.txt",
     },
 )
 

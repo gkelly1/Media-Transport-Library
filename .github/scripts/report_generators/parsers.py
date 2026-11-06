@@ -226,8 +226,9 @@ def _extract_nic_category_from_filename(filename):
     if match:
         return f"{match.group(1)}-{match.group(2)}".upper(), match.group(3)
 
-    # Fallback to simple pattern: nightly-test-report-{nic}-{category}.html
-    match = re.match(r"nightly-test-report-([^-]+)-(.+)", filename)
+    # Fallback to simple pattern: nightly-test-report-{nic}-{category}.html,
+    # or nightly-test-report-{nic}-{category}-{shard}.html for a shard
+    match = re.match(r"nightly-test-report-([^-]+)-(.+?)(?:-\d+)?$", filename)
     if match:
         return match.group(1).upper(), match.group(2)
 
@@ -335,7 +336,12 @@ def _determine_test_result(test_classes, result_text):
     test_classes_lower = test_classes.lower()
     result_text_lower = result_text.lower()
 
-    if "passed" in test_classes_lower or "passed" in result_text_lower:
+    # xpassed and xfailed contain passed and failed, so they go first.
+    if "xpassed" in test_classes_lower or "xpassed" in result_text_lower:
+        return "XPASSED"
+    elif "xfailed" in test_classes_lower or "xfailed" in result_text_lower:
+        return "XFAILED"
+    elif "passed" in test_classes_lower or "passed" in result_text_lower:
         return "PASSED"
     elif "error" in test_classes_lower or "error" in result_text_lower:
         return "ERROR"
@@ -343,10 +349,6 @@ def _determine_test_result(test_classes, result_text):
         return "FAILED"
     elif "skipped" in test_classes_lower or "skipped" in result_text_lower:
         return "SKIPPED"
-    elif "xpassed" in test_classes_lower or "xpassed" in result_text_lower:
-        return "XPASSED"
-    elif "xfailed" in test_classes_lower or "xfailed" in result_text_lower:
-        return "XFAILED"
 
     return "UNKNOWN"
 

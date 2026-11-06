@@ -7,6 +7,19 @@ from math import floor
 
 from .execute import log_fail
 
+# Fraction of the nominal frame count a recording must reach to count as complete.
+MIN_RECORDED_FRAME_RATIO = 0.5
+
+
+def min_expected_frames(fps: float, test_time: float) -> int:
+    """Frames a *test_time*-second recording at *fps* must hold to be complete.
+
+    RX opens before TX and both are killed on a timer, and pacing training eats
+    the first seconds, so healthy recordings land well short of nominal. Never 0
+    -- an empty recording must never pass.
+    """
+    return max(1, int(fps * test_time * MIN_RECORDED_FRAME_RATIO))
+
 
 def check_st20p_integrity(
     src_url: str, out_url: str, frame_size: int, skip_frames: int = 1
@@ -15,14 +28,14 @@ def check_st20p_integrity(
 
     with open(src_url, "rb") as f:
         while chunk := f.read(frame_size):
-            chunk_sum = hashlib.md5(chunk).hexdigest()
+            chunk_sum = hashlib.md5(chunk, usedforsecurity=False).hexdigest()
             src_chunk_sums.append(chunk_sum)
 
     out_chunk_sums = []
 
     with open(out_url, "rb") as f:
         while chunk := f.read(frame_size):
-            chunk_sum = hashlib.md5(chunk).hexdigest()
+            chunk_sum = hashlib.md5(chunk, usedforsecurity=False).hexdigest()
             out_chunk_sums.append(chunk_sum)
 
     # Skip initial frames that may be corrupted during session establishment
@@ -96,6 +109,7 @@ def get_sample_size(format: str) -> int:
 
 
 def get_sample_number(sampling: str, ptime: str) -> int:
+    """Samples per channel in one RTP packet of *ptime* at *sampling*."""
     match sampling:
         case "48kHz":
             match ptime:
@@ -121,7 +135,37 @@ def get_sample_number(sampling: str, ptime: str) -> int:
                     return 32
                 case "4":
                     return 384
+    log_fail(f"Unknown audio sampling/ptime combination: {sampling}/{ptime}")
     return 0
+
+
+# Samples per second per channel, keyed by the sampling string tests pass.
+_SAMPLING_HZ = {"48kHz": 48000, "96kHz": 96000}
+
+# An st30p frame holds as many whole ptime packets as fit in 10 ms
+# (st30_calculate_framebuff_size, lib/src/st2110/st_fmt.c).
+_FRAME_TIME_MS = 10
+
+
+def get_frame_sample_number(sampling: str, ptime: str) -> int:
+    """Samples per channel in one st30p *frame*, not one packet -- the unit the
+    checker compares and RxTxApp's TX wraps its source file by."""
+    packet_samples = get_sample_number(sampling, ptime)
+    if not packet_samples:
+        # get_sample_number already reported the unknown combination.
+        return 0
+
+    frame_samples = _SAMPLING_HZ[sampling] * _FRAME_TIME_MS // 1000
+    return frame_samples // packet_samples * packet_samples
+
+
+def get_min_frame_number(sampling: str, ptime: str, test_time: int) -> int:
+    """Frames a healthy RX must capture in *test_time* seconds -- a truncated
+    capture is bit-exact, so only length catches it."""
+    frame_samples = get_frame_sample_number(sampling, ptime)
+    if not frame_samples:
+        return 0
+    return min_expected_frames(_SAMPLING_HZ[sampling] / frame_samples, test_time)
 
 
 def get_channel_number(channel: str) -> int:
@@ -143,6 +187,7 @@ def get_channel_number(channel: str) -> int:
 
             if match:
                 return int(match.group(1))
+    log_fail(f"Unknown audio channel: {channel}")
     return 0
 
 

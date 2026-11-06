@@ -46,13 +46,14 @@ struct st40p_tx_ctx {
   bool ready;
 
   int frames_per_sec;
+  uint64_t frame_period_ns; /* derived from ops.fps at create, non-zero */
 
   /* for ST40P_TX_FLAG_BLOCK_GET */
   bool block_get;
   pthread_cond_t block_wake_cond;
   pthread_mutex_t block_wake_mutex;
   uint64_t block_timeout_ns;
-  bool block_wake_pending;
+  uint32_t wake_block_cnt;
 
   /* get frame stat */
   uint32_t stat_get_frame_try;

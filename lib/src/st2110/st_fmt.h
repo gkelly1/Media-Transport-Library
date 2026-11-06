@@ -39,6 +39,8 @@ const char* st_tx_pacing_way_name(enum st21_tx_pacing_way way);
 
 int st_get_fps_timing(enum st_fps fps, struct st_fps_timing* fps_tm);
 
+int st_frame_period_ns(enum st_fps fps, uint64_t* period_ns);
+
 enum st_frame_sampling st_frame_fmt_get_sampling(enum st_frame_fmt fmt);
 
 int st22_rtp_bandwidth_bps(uint32_t total_pkts, uint16_t pkt_size, enum st_fps fps,
@@ -47,6 +49,17 @@ int st22_rtp_bandwidth_bps(uint32_t total_pkts, uint16_t pkt_size, enum st_fps f
 int st22_frame_bandwidth_bps(size_t frame_size, enum st_fps fps, uint64_t* bps);
 
 uint64_t st_tai_round_to_media_clk_ns(uint64_t tai_ns, uint32_t sampling_rate);
+
+/* Rounds value*multiplier/divisor to the nearest integer; exact ties round down. */
+uint64_t st_muldiv_u64_round_closest(uint64_t value, uint64_t multiplier,
+                                     uint64_t divisor);
+
+/* epoch k of a den/mul s period starts at floor(k * 1e9 * den / mul) ns TAI */
+uint64_t st_epoch_to_tai(uint64_t epoch, uint32_t mul, uint32_t den);
+/* the epoch tai_ns is in, the inverse of st_epoch_to_tai() */
+uint64_t st_tai_to_epoch(uint64_t tai_ns, uint32_t mul, uint32_t den);
+/* the epoch whose exact start is nearest tai_ns, ties to the later one */
+uint64_t st_tai_to_nearest_epoch(uint64_t tai_ns, uint32_t mul, uint32_t den);
 
 static inline void st20_unpack_pg2be_422le10(struct st20_rfc4175_422_10_pg2_be* pg,
                                              uint16_t* cb00, uint16_t* y00,

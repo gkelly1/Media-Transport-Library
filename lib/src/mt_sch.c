@@ -5,6 +5,9 @@
 #include "mt_sch.h"
 
 #include <signal.h>
+#ifndef WINDOWSENV
+#include <numaif.h>
+#endif
 
 #include "mt_instance.h"
 #include "mt_log.h"
@@ -12,11 +15,9 @@
 #include "mtl_lcore_shm_api.h"
 #include "st2110/st_rx_ancillary_session.h"
 #include "st2110/st_rx_audio_session.h"
-#include "st2110/st_rx_fastmetadata_session.h"
 #include "st2110/st_rx_video_session.h"
 #include "st2110/st_tx_ancillary_session.h"
 #include "st2110/st_tx_audio_session.h"
-#include "st2110/st_tx_fastmetadata_session.h"
 #include "st2110/st_tx_video_session.h"
 
 static inline void sch_mgr_lock(struct mt_sch_mgr* mgr) {
@@ -85,9 +86,11 @@ static int sch_tasklet_sleep(struct mtl_main_impl* impl, struct mtl_sch_impl* sc
   } else {
     rte_eal_alarm_set(sleep_us, sch_sleep_alarm_handler, sch);
     mt_pthread_mutex_lock(&sch->sleep_wake_mutex);
-    /* timeout 1s */
-    mt_pthread_cond_timedwait_ns(&sch->sleep_wake_cond, &sch->sleep_wake_mutex, NS_PER_S);
+    /* timeout 1s, safety net in case the alarm above missed */
+    const int _ret = mt_pthread_cond_timedwait_ns(&sch->sleep_wake_cond,
+                                                  &sch->sleep_wake_mutex, NS_PER_S);
     mt_pthread_mutex_unlock(&sch->sleep_wake_mutex);
+    if (_ret) dbg("%s(%d), cond timedwait ret %d\n", __func__, sch->idx, _ret);
   }
   uint64_t end = mt_get_tsc(impl);
   uint64_t delta = end - start;
@@ -118,6 +121,35 @@ static bool sch_tasklet_time_measure(struct mtl_main_impl* impl) {
   return enabled;
 }
 
+/* MPOL_LOCAL lacks the default policy's MPOL_F_MOF, so a NUMA balancing scan run on this
+ * busy thread rewrites no PTEs and faults migrate nothing; allocation is unchanged. */
+static bool sch_set_local_mempolicy(struct mtl_sch_impl* sch) {
+#ifndef WINDOWSENV
+  int mode;
+  int ret = get_mempolicy(&mode, NULL, 0, NULL, 0);
+  if (!ret && mode != MPOL_DEFAULT) return false;
+  if (!ret) ret = set_mempolicy(MPOL_LOCAL, NULL, 0);
+  if (!ret) return true;
+  if (errno == ENOSYS)
+    dbg("%s(%d), no NUMA mempolicy support\n", __func__, sch->idx);
+  else
+    warn_once("%s(%d), no MPOL_LOCAL, %s, NUMA balancing may stall tasklets\n", __func__,
+              sch->idx, strerror(errno));
+#else
+  MTL_MAY_UNUSED(sch);
+#endif
+  return false;
+}
+
+/* EAL lcores go back to the pool for other users. */
+static void sch_restore_default_mempolicy(bool local) {
+#ifndef WINDOWSENV
+  if (local) set_mempolicy(MPOL_DEFAULT, NULL, 0);
+#else
+  MTL_MAY_UNUSED(local);
+#endif
+}
+
 static int sch_tasklet_func(struct mtl_sch_impl* sch) {
   struct mtl_main_impl* impl = sch->parent;
   int idx = sch->idx;
@@ -126,6 +158,8 @@ static int sch_tasklet_func(struct mtl_sch_impl* sch) {
   struct mt_sch_tasklet_impl* tasklet;
   uint64_t loop_cal_start_ns;
   uint64_t loop_cnt = 0;
+
+  bool local_mempolicy = sch_set_local_mempolicy(sch);
 
   num_tasklet = sch->max_tasklet_idx;
   info("%s(%d), start with %d tasklets, t_pid %d\n", __func__, idx, num_tasklet,
@@ -199,6 +233,7 @@ static int sch_tasklet_func(struct mtl_sch_impl* sch) {
     if (ops->stop) ops->stop(ops->priv);
   }
 
+  sch_restore_default_mempolicy(local_mempolicy);
   rte_atomic32_set(&sch->stopped, 1);
   info("%s(%d), end with %d tasklets\n", __func__, idx, num_tasklet);
   return 0;
@@ -466,7 +501,7 @@ static int sch_stat(void* priv) {
 }
 
 static int sch_filelock_lock(struct mt_sch_mgr* mgr) {
-  int fd = open(MT_FLOCK_PATH, O_RDONLY | O_CREAT, 0666);
+  int fd = open(MT_FLOCK_PATH, O_RDONLY | O_CREAT, 0444);
   if (fd < 0) {
     /* sometimes may fail due to user permission, try open read-only */
     fd = open(MT_FLOCK_PATH, O_RDONLY);
@@ -661,8 +696,8 @@ static void lcore_shm_check_and_clean(struct mt_lcore_shm_entry* shm_entry,
 #endif
 }
 
-int mt_sch_get_lcore(struct mtl_main_impl* impl, unsigned int* lcore,
-                     enum mt_lcore_type type, int socket) {
+static int sch_get_lcore(struct mtl_main_impl* impl, unsigned int* lcore,
+                         enum mt_lcore_type type, int socket) {
   unsigned int cur_lcore;
   int ret;
   bool skip_numa_check = false;
@@ -753,7 +788,17 @@ again:
   return -EIO;
 }
 
-int mt_sch_put_lcore(struct mtl_main_impl* impl, unsigned int lcore) {
+int mt_sch_get_lcore(struct mtl_main_impl* impl, unsigned int* lcore,
+                     enum mt_lcore_type type, int socket) {
+  struct mt_sch_mgr* mgr = mt_sch_get_mgr(impl);
+
+  mt_pthread_mutex_lock(&mgr->lcore_mutex);
+  int ret = sch_get_lcore(impl, lcore, type, socket);
+  mt_pthread_mutex_unlock(&mgr->lcore_mutex);
+  return ret;
+}
+
+static int sch_put_lcore(struct mtl_main_impl* impl, unsigned int lcore) {
   int ret;
   struct mt_sch_mgr* mgr = mt_sch_get_mgr(impl);
 
@@ -814,20 +859,29 @@ int mt_sch_put_lcore(struct mtl_main_impl* impl, unsigned int lcore) {
   return ret;
 }
 
+int mt_sch_put_lcore(struct mtl_main_impl* impl, unsigned int lcore) {
+  struct mt_sch_mgr* mgr = mt_sch_get_mgr(impl);
+
+  mt_pthread_mutex_lock(&mgr->lcore_mutex);
+  int ret = sch_put_lcore(impl, lcore);
+  mt_pthread_mutex_unlock(&mgr->lcore_mutex);
+  return ret;
+}
+
 bool mt_sch_lcore_valid(struct mtl_main_impl* impl, unsigned int lcore) {
   struct mt_sch_mgr* mgr = mt_sch_get_mgr(impl);
   struct mt_lcore_shm* lcore_shm = mgr->lcore_mgr.lcore_shm;
 
   if (lcore >= RTE_MAX_LCORE) {
     err("%s, invalid lcore %d\n", __func__, lcore);
-    return -EIO;
+    return false;
   }
 
   if (mt_is_manager_connected(impl)) return true;
 
   if (!lcore_shm) {
     err("%s, no lcore shm attached\n", __func__);
-    return -EIO;
+    return false;
   }
 
   return lcore_shm->lcores_info[lcore].active;
@@ -934,6 +988,7 @@ int mt_sch_mrg_init(struct mtl_main_impl* impl, int data_quota_mbs_limit) {
   int ret;
 
   mt_pthread_mutex_init(&mgr->mgr_mutex, NULL);
+  mt_pthread_mutex_init(&mgr->lcore_mutex, NULL);
 
   mgr->lcore_lock_fd = -1;
 
@@ -971,9 +1026,6 @@ int mt_sch_mrg_init(struct mtl_main_impl* impl, int data_quota_mbs_limit) {
     /* init mgr lock for anc */
     mt_pthread_mutex_init(&sch->tx_anc_mgr_mutex, NULL);
     mt_pthread_mutex_init(&sch->rx_anc_mgr_mutex, NULL);
-    /* init mgr lock for fmd */
-    mt_pthread_mutex_init(&sch->tx_fmd_mgr_mutex, NULL);
-    mt_pthread_mutex_init(&sch->rx_fmd_mgr_mutex, NULL);
 
     mt_stat_register(impl, sch_stat, sch, "sch");
   }
@@ -1007,15 +1059,13 @@ int mt_sch_mrg_uinit(struct mtl_main_impl* impl) {
     mt_pthread_mutex_destroy(&sch->tx_anc_mgr_mutex);
     mt_pthread_mutex_destroy(&sch->rx_anc_mgr_mutex);
 
-    mt_pthread_mutex_destroy(&sch->tx_fmd_mgr_mutex);
-    mt_pthread_mutex_destroy(&sch->rx_fmd_mgr_mutex);
-
     mt_pthread_mutex_destroy(&sch->sleep_wake_mutex);
     mt_pthread_cond_destroy(&sch->sleep_wake_cond);
 
     mt_pthread_mutex_destroy(&sch->mutex);
   }
 
+  mt_pthread_mutex_destroy(&mgr->lcore_mutex);
   mt_pthread_mutex_destroy(&mgr->mgr_mutex);
   return 0;
 };
@@ -1084,14 +1134,6 @@ int mt_sch_put(struct mtl_sch_impl* sch, int quota_mbs) {
     mt_pthread_mutex_lock(&sch->rx_anc_mgr_mutex);
     st_rx_ancillary_sessions_sch_uinit(sch);
     mt_pthread_mutex_unlock(&sch->rx_anc_mgr_mutex);
-
-    mt_pthread_mutex_lock(&sch->tx_fmd_mgr_mutex);
-    st_tx_fastmetadata_sessions_sch_uinit(sch);
-    mt_pthread_mutex_unlock(&sch->tx_fmd_mgr_mutex);
-
-    mt_pthread_mutex_lock(&sch->rx_fmd_mgr_mutex);
-    st_rx_fastmetadata_sessions_sch_uinit(sch);
-    mt_pthread_mutex_unlock(&sch->rx_fmd_mgr_mutex);
 
     sch_free(sch);
   }

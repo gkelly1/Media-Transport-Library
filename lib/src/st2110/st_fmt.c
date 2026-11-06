@@ -4,6 +4,8 @@
 
 #include "st_fmt.h"
 
+#include <math.h>
+
 #include "../mt_log.h"
 #include "st_main.h"
 
@@ -730,6 +732,23 @@ int st_get_fps_timing(enum st_fps fps, struct st_fps_timing* fps_tm) {
   return -EINVAL;
 }
 
+int st_frame_period_ns(enum st_fps fps, uint64_t* period_ns) {
+  struct st_fps_timing fps_tm;
+  int ret;
+
+  ret = st_get_fps_timing(fps, &fps_tm);
+  if (ret < 0)
+    return ret;
+  else if (fps_tm.mul <= 0 || fps_tm.den <= 0)
+    return -EINVAL;
+
+  /* NS_PER_S is an int macro, so cast before multiplying: NS_PER_S * den
+   * overflows int for the four 1001-denominator rates. Multiply before
+   * dividing, or den / mul truncates to zero. */
+  *period_ns = (uint64_t)NS_PER_S * fps_tm.den / fps_tm.mul;
+  return 0;
+}
+
 double st_frame_rate(enum st_fps fps) {
   int i;
 
@@ -743,6 +762,12 @@ double st_frame_rate(enum st_fps fps) {
   return 0;
 }
 
+/* st_fps_timings windows are up to a full fps wide, so a match can be a snap to a
+ * neighbouring rate rather than a hit. Past this gap from the exact mul/den ratio it is a
+ * snap, not a decimal rounding of it. Callers naming the rate by the rounded name in the
+ * table are caught by the equality test, so this only has to bound the rounding. */
+#define ST_FPS_SNAP_TOLERANCE (1e-3)
+
 enum st_fps st_frame_rate_to_st_fps(double framerate) {
   int i;
 
@@ -750,6 +775,15 @@ enum st_fps st_frame_rate_to_st_fps(double framerate) {
     if (framerate == st_fps_timings[i].framerate ||
         ((framerate >= st_fps_timings[i].framerate - st_fps_timings[i].lower_limit) &&
          (framerate <= st_fps_timings[i].framerate + st_fps_timings[i].upper_limit))) {
+      double exact = (double)st_fps_timings[i].mul / st_fps_timings[i].den;
+
+      if (framerate != st_fps_timings[i].framerate &&
+          fabs(framerate - exact) > ST_FPS_SNAP_TOLERANCE) {
+        warn(
+            "%s, %f fps is not a ST 2110 rate, snapping to %s (%f fps), the transport "
+            "will pace at the snapped rate\n",
+            __func__, framerate, st_fps_timings[i].name, exact);
+      }
       return st_fps_timings[i].fps;
     }
   }
@@ -906,8 +940,8 @@ bool st_frame_fmt_equal_transport(enum st_frame_fmt fmt, enum st20_fmt tfmt) {
   return (fmt == to_fmt) ? true : false;
 }
 
-static uint64_t st_muldiv_u64_round_closest(uint64_t value, uint64_t multiplier,
-                                            uint64_t divisor) {
+uint64_t st_muldiv_u64_round_closest(uint64_t value, uint64_t multiplier,
+                                     uint64_t divisor) {
   /* keep conversions reproducible without relying on floating point */
   __uint128_t product = (__uint128_t)value * multiplier;
   __uint128_t quotient = product / divisor;
@@ -917,6 +951,23 @@ static uint64_t st_muldiv_u64_round_closest(uint64_t value, uint64_t multiplier,
   if (remainder > half) quotient++; /* ties round down to keep jitter bounded */
 
   return (uint64_t)quotient;
+}
+
+uint64_t st_epoch_to_tai(uint64_t epoch, uint32_t mul, uint32_t den) {
+  __uint128_t tai = (__uint128_t)epoch * NS_PER_S * den / mul;
+
+  return tai >= UINT64_MAX ? UINT64_MAX : (uint64_t)tai;
+}
+
+uint64_t st_tai_to_epoch(uint64_t tai_ns, uint32_t mul, uint32_t den) {
+  return (uint64_t)((((__uint128_t)tai_ns + 1) * mul - 1) /
+                    ((__uint128_t)NS_PER_S * den));
+}
+
+uint64_t st_tai_to_nearest_epoch(uint64_t tai_ns, uint32_t mul, uint32_t den) {
+  __uint128_t period_num = (__uint128_t)NS_PER_S * den;
+
+  return (uint64_t)(((__uint128_t)2 * tai_ns * mul + period_num) / (2 * period_num));
 }
 
 uint64_t st_tai_round_to_media_clk_ns(uint64_t tai_ns, uint32_t sampling_rate) {
@@ -930,6 +981,23 @@ uint64_t st_tai_round_to_media_clk_ns(uint64_t tai_ns, uint32_t sampling_rate) {
   uint64_t tick = st_muldiv_u64_round_closest(tai_ns, sampling_rate, NS_PER_S);
   if ((__uint128_t)tick * NS_PER_S / sampling_rate >= UINT64_MAX) return UINT64_MAX;
   return st_muldiv_u64_round_closest(tick, NS_PER_S, sampling_rate);
+}
+
+uint64_t st10_media_clk_to_tai(uint64_t anchor_tai_ns, uint32_t media_ts,
+                               uint32_t sampling_rate) {
+  if (!sampling_rate) {
+    err("%s, invalid sampling rate\n", __func__);
+    return anchor_tai_ns;
+  }
+
+  const int64_t ticks_per_cycle = (int64_t)1 << 32;
+  long double anchor_ticks = (long double)anchor_tai_ns * sampling_rate / NS_PER_S;
+  /* Cycle count, not a tick value -- llroundl()'s away-from-zero ties don't
+   * need to match st_muldiv_u64_round_closest()'s round-down ties below. */
+  int64_t cycle = llroundl((anchor_ticks - (long double)media_ts) / ticks_per_cycle);
+  uint64_t unwrapped_ticks = (uint64_t)((int64_t)media_ts + cycle * ticks_per_cycle);
+
+  return st_muldiv_u64_round_closest(unwrapped_ticks, NS_PER_S, sampling_rate);
 }
 
 uint32_t st10_tai_to_media_clk(uint64_t tai_ns, uint32_t sampling_rate) {
@@ -976,7 +1044,7 @@ int st_draw_logo(struct st_frame* frame, struct st_frame* logo, uint32_t x, uint
   for (uint32_t col = 0; col < logo->height; col++) {
     void* dst = frame->addr[0] + (((col + y) * frame->width) + x) / 2 * 5;
     void* src = logo->addr[0] + (col * logo->width) / 2 * 5;
-    mtl_memcpy(dst, src, logo_col_size);
+    mt_memcpy(dst, src, logo_col_size);
   }
 
   return 0;
@@ -1058,7 +1126,7 @@ double st30_get_packet_time(enum st30_ptime ptime) {
       packet_time_ns = (double)1000000000.0 * 4 / 1000;
       break;
     case ST31_PTIME_80US:
-      packet_time_ns = (double)1000000000.0 * 1 / 12500;
+      packet_time_ns = (double)1000000000.0 * 4 / 48000;
       break;
     case ST31_PTIME_1_09MS:
       packet_time_ns = (double)1000000000.0 * 48 / 44100;
@@ -1289,12 +1357,13 @@ struct st_frame* st_frame_create_by_malloc(enum st_frame_fmt fmt, uint32_t w, ui
   frame->flags = ST_FRAME_FLAG_SINGLE_MALLOC;
 
   size_t data_sz = st_frame_size(fmt, w, h, interlaced);
-  void* data = mt_zmalloc(data_sz);
+  void* data = data_sz ? mt_zmalloc(data_sz) : NULL;
   if (!data) {
     err("%s, data malloc fail, size %" PRIu64 "\n", __func__, data_sz);
     st_frame_free(frame);
     return NULL;
   }
+  frame->addr[0] = data; /* st_frame_free() frees it */
   frame->buffer_size = data_sz;
   frame->data_size = data_sz;
   /* init plane */

@@ -32,12 +32,12 @@ if (( LOCAL )); then
 else
   # shellcheck source=/dev/null
   source "$ROOT/config/nodes.env"
-  : "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env (or run it on the worker with --local)}"
+  # shellcheck source=lib/inventory.sh
+  source "$ROOT/scripts/lib/inventory.sh"
 
   NODE="${1:-$LAB_DEFAULT_NODE}"
-  KEY="${NODE^^}_HOST"; KEY="${KEY//-/_}"
-  HOST="${!KEY:-}"
-  [[ -n "$HOST" ]] || { echo "FATAL: no address for $NODE ($KEY) in config/nodes.env" >&2; exit 2; }
+  TARGET="$(lab_target_of "$NODE")" || exit 2
+  HOST="${TARGET#*@}"
   echo "== BIOS BKC check for $NODE ($HOST) =="
 fi
 
@@ -216,5 +216,5 @@ PRE
 if (( LOCAL )); then
   printf '%s\n%s\n' "$PRELUDE" "$CHECKS" | bash -s
 else
-  printf '%s\n%s\n' "$PRELUDE" "$CHECKS" | ssh -o BatchMode=yes -o ConnectTimeout=10 "${LAB_SSH_USER}@$HOST" 'bash -s'
+  printf '%s\n%s\n' "$PRELUDE" "$CHECKS" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" 'bash -s'
 fi

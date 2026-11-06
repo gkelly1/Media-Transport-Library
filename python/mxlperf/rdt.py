@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .common import ROOT, dump_json, read_env, run
+from .common import ROOT, dump_json, node_login, read_env, run
 from .host_noise import is_host_noise
 
 REMOTE_HELPER = "/usr/local/sbin/mxl-rdt-host"
@@ -41,13 +41,12 @@ def validate_rdt_config(cfg: dict[str, str]) -> None:
 def _target(cfg: dict[str, str]) -> str:
     inventory = read_env(ROOT / "config/nodes.env")
     node = cfg.get("NODE", cfg["LAB_DEFAULT_NODE"])
-    key = node.upper().replace("-", "_") + "_HOST"
-    address = inventory.get(key)
+    user, address = node_login(inventory, node)
+    key = node.upper().replace("-", "_")
     if not address:
-        raise ValueError(f"RDT has no SSH address for node {node} ({key})")
-    user = inventory.get("LAB_SSH_USER")
+        raise ValueError(f"RDT has no SSH address for node {node} ({key}_HOST)")
     if not user:
-        raise ValueError("RDT needs LAB_SSH_USER in config/nodes.env")
+        raise ValueError(f"RDT needs {key}_USER or LAB_SSH_USER in config/nodes.env")
     return f"{user}@{address}"
 
 

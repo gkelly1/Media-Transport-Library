@@ -11,13 +11,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
 NODE="${1:-$LAB_DEFAULT_NODE}"
-KEY="${NODE^^}_HOST"
-KEY="${KEY//-/_}"
-HOST="${!KEY:-}"
-[[ -n "$HOST" ]] || { echo "FATAL: no host address for $NODE ($KEY)" >&2; exit 2; }
-TARGET="${LAB_SSH_USER}@$HOST"
+TARGET="$(lab_target_of "$NODE")" || exit 2
 
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" '
   set -eu

@@ -70,18 +70,18 @@ scripts/install-k8s-cluster.sh
 
 Run it from the repo root on the control-plane host, or on any machine with SSH key
 access to both nodes. The installer prints a plan before doing anything — check that
-the login and proxy lines say what you expect:
+the logins and proxy lines say what you expect:
 
 ```
 == plan ==
-  controller: control-plane (<control-plane IP>)
-  worker:     worker-1 (<worker IP>)
+  controller: control-plane (<login>@<control-plane IP>)
+  worker:     worker-1 (<login>@<worker IP>)
   kubernetes: 1.35.1-1.1    pod CIDR: 10.244.0.0/16    CNI: Calico (VXLAN)
-  login:      root
+  sudo:       password prompted on each non-root node
   proxy:      none (set LAB_HTTP_PROXY in config/lab.env if this network needs one)
 ```
 
-With `LAB_SSH_USER=root` the whole install is unattended. With a normal login every
+With `root` as every node's login the whole install is unattended. With a normal login every
 stage that needs root uses `sudo`, and you are prompted for each node's password on
 that node's own prompt. Five stages:
 

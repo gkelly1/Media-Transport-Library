@@ -9,7 +9,7 @@
 #   scripts/setup-controller-worker-ssh.sh
 #
 # Nodes come from LAB_CONTROLLER and LAB_WORKERS in config/lab.env; addresses
-# and the login come from config/nodes.env.
+# and the login come from config/nodes.env (<NODE>_USER, else LAB_SSH_USER).
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,14 +17,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
 
-target_for() {
-  local key="${1^^}_HOST"; key="${key//-/_}"
-  local addr="${!key:-}"
-  [[ -n "$addr" ]] || { echo "FATAL: no address for $1 ($key) in config/nodes.env" >&2; exit 2; }
-  printf '%s@%s' "$LAB_SSH_USER" "$addr"
-}
+target_for() { lab_target_of "$1" || exit 2; }
 
 CONTROLLER="$(target_for "$LAB_CONTROLLER")"
 IFS=, read -r -a WORKER_NODES <<<"$LAB_WORKERS"

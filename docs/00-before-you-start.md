@@ -10,12 +10,12 @@ and later requirements.
 You need all of the following before starting Chapter 1:
 
 - Two clean Ubuntu 22.04 or 24.04 hosts: one control-plane host and one Xeon worker.
-- The same login name on both hosts.
+- A login on each host. It may be the same name everywhere or different per host.
 - SSH key authentication from the control-plane host to itself and to every worker,
   with no password prompt.
-- `sudo` access for that login, or `LAB_SSH_USER=root` for an unattended install.
+- `sudo` access for each login, or a `root` login for an unattended install.
 - This repository checked out on the control-plane host.
-- `config/nodes.env` filled in with the addresses and SSH login.
+- `config/nodes.env` filled in with the addresses and SSH logins.
 
 You do **not** need to install Kubernetes, `kubectl`, containerd, or Python manually
 on the worker. Chapter 2 installs the node software over SSH. `kubectl` is also
@@ -36,7 +36,7 @@ These items are not required to complete the initial setup:
 If you skipped this page, the first script you run says so:
 
 ```
-scripts/check-bios.sh: line 19: LAB_SSH_USER: set LAB_SSH_USER in config/nodes.env
+FATAL: no login for worker-1: set WORKER_1_USER or LAB_SSH_USER in config/nodes.env
 ```
 
 That means `config/nodes.env` has not been completed yet.
@@ -51,15 +51,17 @@ That means `config/nodes.env` has not been completed yet.
 More workers only means more entries in step 4. Both hosts can be freshly installed;
 nothing else has to be prepared by hand.
 
-You need **one login that exists on both hosts, with the same name**, able to become
-root. Every script uses exactly that login and never stores a password.
+You need **one login on each host**, able to become root. By default every host uses
+the same one (`LAB_SSH_USER`); a host whose account has a different name sets its own
+`<NODE>_USER` instead (see step 4). Every script uses exactly the login configured for
+the host it talks to and never stores a password.
 
-Choose one access mode:
+Choose one access mode per host:
 
 - **non-root user (Recommended):** use a normal login with `sudo`. SSH uses keys and must not prompt;
   `sudo` may prompt for the host's password during installation.
-- **root user (Unattended option):** set `LAB_SSH_USER=root`. The scripts omit `sudo` and stop
-  requesting a tty, so the installation does not prompt.
+- **root user (Unattended option):** set that host's login to `root`. The scripts omit `sudo` and stop
+  requesting a tty for it, so the installation does not prompt.
 
 Passwordless SSH and passwordless `sudo` are different requirements:
 
@@ -129,9 +131,9 @@ You can copy it across with `scripts/sync-controller.sh`.
 
 ## 3. Required SSH access
 
-Run these commands on the control-plane host as the same login configured in
-`LAB_SSH_USER` — not as root, because the key must belong to the login used by the
-scripts.
+Run these commands on the control-plane host as the login configured for it
+(`CONTROL_PLANE_USER`, else `LAB_SSH_USER`) — not as root, because the key must belong
+to the login used by the scripts.
 
 Almost every script reaches a host over SSH non-interactively (`BatchMode`), so SSH
 password prompts must be gone **before** you start. Sudo passwords are different:
@@ -182,6 +184,13 @@ WORKER_1_HOST=<the worker IP or hostname>
 LAB_SSH_USER=<the login from step 1>
 ```
 
+If a host uses a different login, add a `<NODE>_USER` line for it; it overrides
+`LAB_SSH_USER` for that host only:
+
+```bash
+WORKER_1_USER=<the worker's login>
+```
+
 > **Address requirements**
 >
 > Use the address each host is reachable at **from the other host**. Give the
@@ -194,7 +203,7 @@ LAB_SSH_USER=<the login from step 1>
 ### How the variable names are derived
 
 Each `_HOST` key is the Kubernetes node name, uppercased, with `-` replaced by
-`_`, plus `_HOST`:
+`_`, plus `_HOST`. The optional per-host login uses the same name with `_USER`:
 
 | Kubernetes node name | `config/nodes.env` key |
 |---|---|
@@ -225,22 +234,24 @@ Do not start Chapter 1 until this check prints one `ok` line per host. Run it on
 the control-plane host from the repository root:
 
 ```bash
+source config/lab.env
 source config/nodes.env
-for var in $(grep -o '^[A-Z0-9_]*_HOST' config/nodes.env); do
-  ssh -o BatchMode=yes "$LAB_SSH_USER@${!var}" "echo $var ok"
+source scripts/lib/inventory.sh
+for node in "$LAB_CONTROLLER" ${LAB_WORKERS//,/ }; do
+  ssh -o BatchMode=yes "$(lab_target_of "$node")" "echo $node ok"
 done
 ```
 
 Expected output is similar to:
 
 ```text
-CONTROL_PLANE_HOST ok
-WORKER_1_HOST ok
+control-plane ok
+worker-1 ok
 ```
 
 Common failures:
 
-- `LAB_SSH_USER` is unset — fill in `config/nodes.env` or source it again.
+- `no login for <node>` — set `<NODE>_USER` or `LAB_SSH_USER` in `config/nodes.env`.
 - `Permission denied (publickey)` — SSH key setup is incomplete.
 - `Could not resolve hostname` — check the address in `config/nodes.env`.
 - A sudo password prompt — expected for a normal sudo user; it is not an SSH

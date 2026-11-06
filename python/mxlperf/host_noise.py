@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .common import ROOT, compact_cpus, read_env, run
+from .common import ROOT, compact_cpus, node_login, read_env, run
 from .render import cpu_pools
 
 REMOTE_DIR = "/tmp/mxl-host-noise"
@@ -20,13 +20,12 @@ def is_host_noise(cfg: dict[str, str]) -> bool:
 def ssh_target(cfg: dict[str, str]) -> str:
     inventory = read_env(ROOT / "config/nodes.env")
     node = cfg.get("NODE", cfg["LAB_DEFAULT_NODE"])
-    address_key = node.upper().replace("-", "_") + "_HOST"
-    address = inventory.get(address_key)
+    key = node.upper().replace("-", "_")
+    user, address = node_login(inventory, node)
     if not address:
-        raise ValueError(f"host noisy-neighbor has no SSH address for node {node} ({address_key})")
-    user = inventory.get("LAB_SSH_USER")
+        raise ValueError(f"host noisy-neighbor has no SSH address for node {node} ({key}_HOST)")
     if not user:
-        raise ValueError("host noisy-neighbor needs LAB_SSH_USER in config/nodes.env")
+        raise ValueError(f"host noisy-neighbor needs {key}_USER or LAB_SSH_USER in config/nodes.env")
     return f"{user}@{address}"
 
 

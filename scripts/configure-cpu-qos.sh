@@ -29,10 +29,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
 # shellcheck source=lib/remote-admin.sh
 source "$ROOT/scripts/lib/remote-admin.sh"
-lab_remote_admin_init "$LAB_SSH_USER"
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
 # shellcheck source=lib/cpu-topology.sh
 source "$ROOT/scripts/lib/cpu-topology.sh"
 # shellcheck source=lib/no-proxy.sh
@@ -41,11 +41,7 @@ lab_export_no_proxy   # or kubectl below reaches the API server through a proxy
 
 VERIFY_ONLY=0
 if [[ "${1:-}" == "--verify" ]]; then VERIFY_ONLY=1; shift; fi
-NODE="${1:-$LAB_DEFAULT_NODE}"
-KEY="${NODE^^}_HOST"; KEY="${KEY//-/_}"
-HOST="${!KEY:-}"
-[[ -n "$HOST" ]] || { echo "FATAL: no address for $NODE ($KEY) in config/nodes.env" >&2; exit 2; }
-TARGET="${LAB_SSH_USER}@$HOST"
+lab_resolve_node "${1:-$LAB_DEFAULT_NODE}"
 RESERVED="${LAB_RESERVED_CPUS:-0-3}"
 
 # SMT is supported, but config/lab.env has to know about it: DEC_CORES and

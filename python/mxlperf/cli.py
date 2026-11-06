@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from .collect import capture, pcm_metric_selector, prom_query
-from .common import ROOT, dump_json, load_config, read_env, run, utc_stamp, expand_cpu_spec
+from .common import ROOT, dump_json, load_config, node_login, read_env, run, utc_stamp, expand_cpu_spec
 from .host_noise import host_noise_snapshot, is_host_noise, start_host_noise, stop_host_noise
 from .platform import PROBE_COMMAND, parse_platform
 from .render import render
@@ -159,12 +159,11 @@ def capture_host(result: Path, cfg: dict[str, str]) -> None:
     }
     try:
         inventory = read_env(ROOT / "config/nodes.env")
-        address_key = node.upper().replace("-", "_") + "_HOST"
-        address = inventory.get(address_key)
-        user = inventory.get("LAB_SSH_USER")
+        user, address = node_login(inventory, node)
         if not address or not user:
+            key = node.upper().replace("-", "_")
             host["live_hardware_probe_error"] = (
-                f"config/nodes.env needs {address_key} and LAB_SSH_USER for the hardware probe"
+                f"config/nodes.env needs {key}_HOST and {key}_USER (or LAB_SSH_USER) for the hardware probe"
             )
         else:
             probe = run([

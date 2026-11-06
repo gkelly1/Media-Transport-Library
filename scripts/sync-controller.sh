@@ -15,12 +15,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
 
-KEY="${LAB_CONTROLLER^^}_HOST"; KEY="${KEY//-/_}"
-HOST="${!KEY:-}"
-[[ -n "$HOST" ]] || { echo "FATAL: no address for $LAB_CONTROLLER ($KEY) in config/nodes.env" >&2; exit 2; }
-TARGET="$LAB_SSH_USER@$HOST"
+TARGET="$(lab_target_of "$LAB_CONTROLLER")" || exit 2
 
 # Relative to the login's home directory unless MXL_REMOTE_ROOT is absolute.
 REMOTE_ROOT="${MXL_REMOTE_ROOT:-mxl-k8s-qos-lab}"

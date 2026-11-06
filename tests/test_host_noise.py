@@ -94,6 +94,14 @@ class HostNoiseTests(unittest.TestCase):
         cfg = {"NODE": "worker-1", "LAB_DEFAULT_NODE": "worker-1"}
         self.assertEqual(ssh_target(cfg), "tester@192.0.2.10")
 
+    @patch("mxlperf.host_noise.read_env")
+    def test_ssh_target_prefers_the_nodes_own_user(self, read_env_mock):
+        read_env_mock.return_value = {
+            "LAB_SSH_USER": "tester", "WORKER_1_USER": "perf", "WORKER_1_HOST": "192.0.2.10",
+        }
+        cfg = {"NODE": "worker-1", "LAB_DEFAULT_NODE": "worker-1"}
+        self.assertEqual(ssh_target(cfg), "perf@192.0.2.10")
+
 
 if __name__ == "__main__":
     unittest.main()

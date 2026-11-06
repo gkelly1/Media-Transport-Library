@@ -22,16 +22,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
 # shellcheck source=lib/remote-admin.sh
 source "$ROOT/scripts/lib/remote-admin.sh"
-lab_remote_admin_init "$LAB_SSH_USER"
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
 
-NODE="${1:-$LAB_DEFAULT_NODE}"
-KEY="${NODE^^}_HOST"; KEY="${KEY//-/_}"
-HOST="${!KEY:-}"
-[[ -n "$HOST" ]] || { echo "FATAL: no address for $NODE ($KEY) in config/nodes.env" >&2; exit 2; }
-TARGET="${LAB_SSH_USER}@$HOST"
+lab_resolve_node "${1:-$LAB_DEFAULT_NODE}"
 
 MCP_LOCAL_DIR="${MCP_LOCAL_DIR:-$(cd "$ROOT/.." && pwd)/cpu-debug-MCP}"
 MCP_REPO="${MCP_REPO:-https://github.com/moleksy/cpu-debug-MCP.git}"
@@ -120,7 +116,7 @@ cat <<EOF
 MCP profiling framework ready on $NODE.
 
 Open a tunnel from the machine running your MCP client:
-  ssh -N -L $MCP_PORT:127.0.0.1:$MCP_PORT ${LAB_SSH_USER}@$HOST
+  ssh -N -L $MCP_PORT:127.0.0.1:$MCP_PORT $TARGET
 
 Then point the client at it (.vscode/mcp.json or your agent config):
   {

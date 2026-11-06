@@ -18,7 +18,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
 
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/12}"
@@ -29,19 +28,24 @@ K8S_VERSION="${K8S_VERSION:-1.35.1-1.1}"
 LAB_HTTP_PROXY="${LAB_HTTP_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}"
 LAB_HTTPS_PROXY="${LAB_HTTPS_PROXY:-${https_proxy:-${HTTPS_PROXY:-$LAB_HTTP_PROXY}}}"
 CALICO_OPERATOR_URL="${CALICO_OPERATOR_URL:-https://raw.githubusercontent.com/projectcalico/calico/v3.32.0/manifests/tigera-operator.yaml}"
-SSH_USER="${LAB_SSH_USER}"
-
 # A root login needs no sudo - and then nothing here has to prompt, so every
 # remote command can run over BatchMode SSH and the whole install is
 # unattended. A normal login gets 'sudo' plus a tty, so that the password
-# prompt appears on the node that is asking for it.
+# prompt appears on the node that is asking for it. Each node has its own
+# login (<NODE>_USER, else LAB_SSH_USER), so this is chosen per node:
+# use_node NODE sets SSH_USER, SUDO and SSH_ADMIN for the commands that follow.
 # shellcheck source=lib/remote-admin.sh
 source "$ROOT/scripts/lib/remote-admin.sh"
-lab_remote_admin_init "$SSH_USER"
-SUDO="$LAB_REMOTE_SUDO"
-SSH_ADMIN=("${LAB_REMOTE_SSH[@]}")
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
+use_node() {
+  SSH_USER="$(lab_user_of "$1")"
+  lab_remote_admin_init "$SSH_USER"
+  SUDO="$LAB_REMOTE_SUDO"
+  SSH_ADMIN=("${LAB_REMOTE_SSH[@]}")
+}
 
-host_of() { local key="${1^^}_HOST"; key="${key//-/_}"; printf '%s' "${!key:-}"; }
+host_of() { lab_host_of "$1"; }
 
 # SSH is happy with a ~/.ssh/config alias or a DNS name, but /etc/hosts and
 # kubeadm's --apiserver-advertise-address need a real IP that the other nodes can
@@ -76,6 +80,7 @@ ip_of() {
 CONTROLLER="$LAB_CONTROLLER"
 IFS=, read -r -a WORKERS <<<"$LAB_WORKERS"
 ALL_NODES=("$CONTROLLER" "${WORKERS[@]}")
+for node in "${ALL_NODES[@]}"; do lab_target_of "$node" >/dev/null || exit 2; done
 
 # /etc/hosts entries: every node must resolve every other node by Kubernetes
 # node name, because that is the name kubeadm puts in certificates and joins.
@@ -160,10 +165,12 @@ NP="env no_proxy='$CLUSTER_NO_PROXY' NO_PROXY='$CLUSTER_NO_PROXY'"
 lab_export_no_proxy   # and for whatever this script runs locally
 
 echo "== plan =="
-echo "  controller: $CONTROLLER ($(host_of "$CONTROLLER"))"
-for node in "${WORKERS[@]}"; do echo "  worker:     $node ($(host_of "$node"))"; done
+echo "  controller: $CONTROLLER ($(lab_target_of "$CONTROLLER"))"
+for node in "${WORKERS[@]}"; do echo "  worker:     $node ($(lab_target_of "$node"))"; done
 echo "  kubernetes: $K8S_VERSION    pod CIDR: $POD_CIDR    CNI: Calico (VXLAN)"
-echo "  login:      $SSH_USER${SUDO:+ (sudo password prompted per node)}"
+for node in "${ALL_NODES[@]}"; do
+  [[ "$(lab_user_of "$node")" == root ]] || { echo "  sudo:       password prompted on each non-root node"; break; }
+done
 if [[ -n "$LAB_HTTP_PROXY$LAB_HTTPS_PROXY" ]]; then
   echo "  proxy:      ${LAB_HTTPS_PROXY:-$LAB_HTTP_PROXY} - apt, containerd and kubeadm get it on every node"
 else
@@ -177,6 +184,7 @@ n=0
 for node in "${ALL_NODES[@]}"; do
   addr="$(host_of "$node")"
   n=$((n+1))
+  use_node "$node"
   echo "-- $node ($n of ${#ALL_NODES[@]}), 2-6 min: apt output follows"
   scp -q "$ROOT/scripts/install-k8s-node.sh" "$SSH_USER@$addr:/tmp/install-k8s-node.sh"
   # POD_CIDR/SERVICE_CIDR are for the containerd proxy NO_PROXY the node script
@@ -187,7 +195,8 @@ done
 
 # ---------------------------------------------------------------------------
 CTRL_ADDR="$(host_of "$CONTROLLER")"
-CTRL="$SSH_USER@$CTRL_ADDR"
+CTRL="$(lab_target_of "$CONTROLLER")"
+use_node "$CONTROLLER"   # the control-plane steps below run as its login
 CTRL_IP="$(ip_of "$CONTROLLER")"      # what the API server advertises to the workers
 
 step "2/5 control plane on $CONTROLLER"
@@ -236,7 +245,7 @@ if (( ! INIT_DONE )); then
   "
 fi
 # kubectl for the unprivileged lab user: everything else in this repo assumes
-# plain 'kubectl' works as \$LAB_SSH_USER on the controller.
+# plain 'kubectl' works as the controller login on the controller.
 ssh -o BatchMode=yes "$CTRL" "
   set -e
   mkdir -p ~/.kube
@@ -323,6 +332,7 @@ for node in "${WORKERS[@]}"; do
     continue
   fi
   echo "-- joining $node (1-2 min)"
+  use_node "$node"
   "${SSH_ADMIN[@]}" "$SSH_USER@$addr" "$SUDO $NP $JOIN_CMD --node-name='$node'"
 done
 

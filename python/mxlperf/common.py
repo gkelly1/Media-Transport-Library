@@ -39,6 +39,17 @@ def read_env(path: Path) -> dict[str, str]:
     return values
 
 
+def node_login(inventory: dict[str, str], node: str) -> tuple[str, str]:
+    """Return (user, address) for a node; either is "" when config/nodes.env lacks it.
+
+    The address is <NODE>_HOST. The login is <NODE>_USER when set, otherwise the
+    LAB_SSH_USER default, so hosts with different accounts need no shared one.
+    """
+    key = node.upper().replace("-", "_")
+    user = inventory.get(f"{key}_USER") or inventory.get("LAB_SSH_USER", "")
+    return user, inventory.get(f"{key}_HOST", "")
+
+
 def load_config(scenario: str, overrides: list[str], noisy_neighbor: str = "") -> dict[str, str]:
     cfg = read_env(ROOT / "config/lab.env")
     scenario_path = Path(scenario)

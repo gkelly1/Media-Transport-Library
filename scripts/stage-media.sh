@@ -16,10 +16,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
 # shellcheck source=lib/remote-admin.sh
 source "$ROOT/scripts/lib/remote-admin.sh"
-lab_remote_admin_init "$LAB_SSH_USER"
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
 
 NODE="$LAB_DEFAULT_NODE"
 CLIPS=()
@@ -30,10 +30,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-KEY="${NODE^^}_HOST"; KEY="${KEY//-/_}"
-HOST="${!KEY:-}"
-[[ -n "$HOST" ]] || { echo "FATAL: no address for $NODE ($KEY) in config/nodes.env" >&2; exit 2; }
-TARGET="${LAB_SSH_USER}@$HOST"
+lab_resolve_node "$NODE"
 DEST="${LAB_MEDIA_HOSTPATH:-/opt/mxl-media}"
 
 if [[ ${#CLIPS[@]} -gt 0 ]]; then

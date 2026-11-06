@@ -7,7 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/config/lab.env"
 # shellcheck source=/dev/null
 source "$ROOT/config/nodes.env"
-: "${LAB_SSH_USER:?set LAB_SSH_USER in config/nodes.env}"
+# shellcheck source=lib/inventory.sh
+source "$ROOT/scripts/lib/inventory.sh"
 # shellcheck source=lib/no-proxy.sh
 source "$ROOT/scripts/lib/no-proxy.sh"
 # shellcheck source=lib/cpu-topology.sh
@@ -53,18 +54,19 @@ fi
 
 IFS=, read -r -a workers <<<"$LAB_WORKERS"
 for node in "${workers[@]}"; do
-  key="$(printf '%s' "$node" | tr 'a-z-' 'A-Z_')_HOST"
-  host="${!key:-}"
+  host="$(lab_host_of "$node")"
+  user="$(lab_user_of "$node")"
   echo "== worker $node (${host:-no SSH address in config/nodes.env}) =="
   kubectl get node "$node" -o jsonpath='  node   Ready={.status.conditions[?(@.type=="Ready")].status} cpu={.status.capacity.cpu} memory={.status.capacity.memory}{"\n"}'
   [[ -n "$host" ]] || { note MISS "no <NODE>_HOST entry in config/nodes.env"; continue; }
-  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$LAB_SSH_USER@$host" true 2>/dev/null; then
-    note MISS "SSH as $LAB_SSH_USER@$host failed - run scripts/setup-controller-worker-ssh.sh"
+  [[ -n "$user" ]] || { note MISS "no login for $node - set $(lab_node_key "$node")_USER or LAB_SSH_USER in config/nodes.env"; continue; }
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$user@$host" true 2>/dev/null; then
+    note MISS "SSH as $user@$host failed - run scripts/setup-controller-worker-ssh.sh"
     continue
   fi
   note OK "SSH reachable"
   controller_epoch="$(date +%s)"
-  worker_epoch="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$LAB_SSH_USER@$host" date +%s 2>/dev/null || echo 0)"
+  worker_epoch="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$user@$host" date +%s 2>/dev/null || echo 0)"
   clock_skew=$((controller_epoch - worker_epoch))
   (( clock_skew < 0 )) && clock_skew=$((-clock_skew))
   if (( clock_skew <= 5 )); then
@@ -74,7 +76,7 @@ for node in "${workers[@]}"; do
   fi
   # The worker checks run in a remote shell, so their MISS lines have to be
   # carried back here to count towards the exit status.
-  worker_report="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$LAB_SSH_USER@$host" "
+  worker_report="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$user@$host" "
     t() { printf '  %-6s %s\n' \"\$1\" \"\$2\"; }
     if [ \"\$(id -u)\" -eq 0 ]; then admin=''; else admin='sudo -n'; fi
     test -d '$LAB_MEDIA_HOSTPATH' && t OK 'media directory $LAB_MEDIA_HOSTPATH' || t MISS 'media directory $LAB_MEDIA_HOSTPATH absent - see docs/05-ffmpeg-mxl-container.md'
@@ -127,7 +129,7 @@ for node in "${workers[@]}"; do
 
   # Runs on the controller, where the awk over lscpu needs no remote quoting.
   if [[ "${LAB_THREADS_PER_CORE:-1}" != "1" ]]; then
-    core_map="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$LAB_SSH_USER@$host" "lscpu -p=CPU,CORE" 2>/dev/null || true)"
+    core_map="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$user@$host" "lscpu -p=CPU,CORE" 2>/dev/null || true)"
     partial="$(lab_partially_reserved_cores "${LAB_RESERVED_CPUS:-}" "$core_map" | tr '\n' ' ')"
     if [[ -z "$core_map" ]]; then
       note WARN "could not read the CPU-to-core map; whole-core reservation unchecked"

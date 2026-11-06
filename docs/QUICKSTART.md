@@ -20,7 +20,8 @@ Requirements:
 
 * Ubuntu 22.04 or 24.04 on both hosts.
 * One control-plane host and one Intel Xeon worker (one or two sockets; set `LAB_SOCKET_COUNT` in `config/lab.env`).
-* The same SSH login on both hosts. Use `root`, or a user with `sudo` access.
+* An SSH login on each host: `root`, or a user with `sudo` access. One shared login
+  works; hosts may also use different logins (`<NODE>_USER` in `config/nodes.env`).
 * Passwordless SSH from the control-plane host to both hosts, including itself.
 * A local 1080p60 MP4 input clip.
 
@@ -55,6 +56,9 @@ CONTROL_PLANE_HOST=<control-plane-ip>
 WORKER_1_HOST=<worker-ip>
 LAB_SSH_USER=<login>
 ```
+
+If one host's login differs, add e.g. `WORKER_1_USER=<its login>`; it overrides
+`LAB_SSH_USER` for that host.
 
 Use real addresses reachable between the hosts, not `localhost` or SSH aliases.
 The default Kubernetes node names are `control-plane` and `worker-1`.

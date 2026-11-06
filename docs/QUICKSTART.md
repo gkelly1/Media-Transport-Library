@@ -19,7 +19,7 @@ kubelet while applying CPU QoS. Use dedicated lab hosts.
 Requirements:
 
 * Ubuntu 22.04 or 24.04 on both hosts.
-* One control-plane host and one two-socket Intel Xeon worker.
+* One control-plane host and one Intel Xeon worker (one or two sockets; set `LAB_SOCKET_COUNT` in `config/lab.env`).
 * The same SSH login on both hosts. Use `root`, or a user with `sudo` access.
 * Passwordless SSH from the control-plane host to both hosts, including itself.
 * A local 1080p60 MP4 input clip.

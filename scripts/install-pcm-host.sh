@@ -78,16 +78,26 @@ systemctl daemon-reload
 systemctl enable --now pcm-sensor-server.service
 # Generous: the port can be blocked by TIME_WAIT for a minute (see the unit
 # above) and PCM then needs another minute to publish counters from 4 CPUs.
-echo "Waiting for PCM UPI metrics on the worker-local endpoint..."
+# A single-socket CPU has no UPI links, so PCM never publishes UPI counters there;
+# wait for the DRAM counters instead.
+SOCKETS="$(lscpu -p=SOCKET | grep -v '^#' | sort -u | wc -l)"
+if (( SOCKETS > 1 )); then
+  READY_MARKER='Incoming_Data_Traffic_On_Link_'
+  READY_WHAT='UPI, DRAM and L3'
+else
+  READY_MARKER='DRAM_Reads'
+  READY_WHAT='DRAM and L3; single socket, so no UPI'
+fi
+echo "Waiting for PCM metrics ($READY_WHAT) on the worker-local endpoint..."
 for _ in {1..240}; do
   if curl --noproxy '*' --connect-timeout 2 --max-time 10 -fsS \
       "http://127.0.0.1:$PCM_PORT/metrics" 2>/dev/null \
-      | grep -F 'Incoming_Data_Traffic_On_Link_' >/dev/null; then
-    echo "PCM host exporter ready on port $PCM_PORT (UPI, DRAM and L3 counters visible)."
+      | grep -F "$READY_MARKER" >/dev/null; then
+    echo "PCM host exporter ready on port $PCM_PORT ($READY_WHAT counters visible)."
     exit 0
   fi
   sleep 1
 done
-echo "FATAL: exporter did not publish UPI counters; see journal below" >&2
+echo "FATAL: exporter did not publish $READY_MARKER counters; see journal below" >&2
 journalctl -u pcm-sensor-server.service --no-pager -n 100 >&2
 exit 1

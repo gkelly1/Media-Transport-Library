@@ -14,7 +14,8 @@
 # Run FROM THE CONTROLLER:
 #   scripts/build-ffmpeg-mxl-image.sh [NODE]      # default: LAB_DEFAULT_NODE
 #
-# Overridables: CBC_REPO, CBC_REF, LAB_IMAGE (from config/lab.env).
+# Overridables: CBC_REPO, CBC_REF, LAB_IMAGE (from config/lab.env),
+# CBC_NO_CACHE=1 (rebuild every layer; BuildKit otherwise reuses cached steps).
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=/dev/null
@@ -35,11 +36,15 @@ HOST="${!KEY:-}"
 TARGET="${LAB_SSH_USER}@$HOST"
 
 CBC_REPO="${CBC_REPO:-https://github.com/cbcrc/guidance-for-building-ffmpeg-with-mxl.git}"
-# Reference BKC build. Bump deliberately: a different FFmpeg or MXL revision
-# changes encoder cost and therefore every density number.
-CBC_REF="${CBC_REF:-9b5098a}"
+# Use a commit SHA whenever possible. Mutable branch names such as
+# "dmf-mxl/master" can be renamed upstream and break the build even though the
+# external reference still exists under a new branch, so keep the lab pinned to a
+# known-good revision rather than a moving branch.
+CBC_REF="${CBC_REF:-88aa58bbcbc51cdfea636d83c30f95ca80151ea6}"
 IMAGE="${LAB_IMAGE:-localhost/mxl-ffmpeg-full:v1}"
 NERDCTL_VERSION="${NERDCTL_VERSION:-2.3.2}"
+BUILD_NO_CACHE=""
+[[ "${CBC_NO_CACHE:-0}" != 1 ]] || BUILD_NO_CACHE=" --no-cache"
 
 # The Dockerfile fetches packages and sources, and a build container inherits none
 # of the node's proxy configuration - not /etc/environment, not containerd's own
@@ -104,7 +109,13 @@ if [[ ! -d guidance-for-building-ffmpeg-with-mxl/.git ]]; then
   git clone '$CBC_REPO' guidance-for-building-ffmpeg-with-mxl
 fi
 cd guidance-for-building-ffmpeg-with-mxl
+git submodule sync --recursive
+git submodule update --init --recursive
 git fetch --all --tags --quiet
+if ! git rev-parse --verify --quiet '$CBC_REF^{commit}' >/dev/null; then
+  echo "FATAL: CBC_REF '$CBC_REF' is not available in the upstream guidance repo. Use a known-good commit SHA or an updated branch name instead of a renamed branch such as dmf-mxl/master." >&2
+  exit 1
+fi
 git checkout --quiet '$CBC_REF'
 echo \"source at \$(git rev-parse --short HEAD)\"
 
@@ -117,7 +128,7 @@ grep -qxF -- '--enable-demuxer=mov' "\$FFMPEG_STREAMING_OPTIONS" \
   || printf '%s\n' '--enable-demuxer=mov' >>"\$FFMPEG_STREAMING_OPTIONS"
 
 echo '== 3/4 image build (namespace k8s.io, so the kubelet can see it) =='
-$LAB_REMOTE_SUDO nerdctl --namespace k8s.io build$BUILD_PROXY -f docker/prod/Dockerfile -t '$IMAGE' .
+$LAB_REMOTE_SUDO nerdctl --namespace k8s.io build$BUILD_NO_CACHE$BUILD_PROXY -f docker/prod/Dockerfile -t '$IMAGE' .
 
 echo '== 4/4 verifying the image =='
 $LAB_REMOTE_SUDO nerdctl --namespace k8s.io images | grep -F 'mxl-ffmpeg-full'
@@ -130,6 +141,11 @@ $LAB_REMOTE_SUDO nerdctl --namespace k8s.io run --rm --net host --entrypoint '${
 $LAB_REMOTE_SUDO nerdctl --namespace k8s.io run --rm --net host --entrypoint '${LAB_FFMPEG:-/opt/bin/ffmpeg}' '$IMAGE' \
   -hide_banner -muxers | grep -E '[[:space:]]mxl[[:space:]]' \
   || { echo 'FATAL: built image has no MXL muxer' >&2; exit 1; }
+# The workload passes -mxl_read_index_init; an image built from a FFmpeg fork
+# revision that predates the rename would reject it at Pod start.
+$LAB_REMOTE_SUDO nerdctl --namespace k8s.io run --rm --net host --entrypoint '${LAB_FFMPEG:-/opt/bin/ffmpeg}' '$IMAGE' \
+  -hide_banner -h demuxer=mxl | grep -q 'mxl_read_index_init' \
+  || { echo 'FATAL: built image lacks -mxl_read_index_init (stale build or old FFmpeg fork revision; retry with CBC_NO_CACHE=1)' >&2; exit 1; }
 "
 
 echo

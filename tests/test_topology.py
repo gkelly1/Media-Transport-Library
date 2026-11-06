@@ -46,6 +46,13 @@ class SiblingTests(unittest.TestCase):
 
 
 class PoolTests(unittest.TestCase):
+    def test_single_socket_uses_a_single_cpu_pool(self):
+        t = topo(LAB_SOCKET_COUNT="1", LAB_CORES_PER_SOCKET="8", LAB_THREADS_PER_CORE="1")
+        self.assertEqual(t.sockets, 1)
+        self.assertEqual(topology.socket_id(t, 0), 0)
+        self.assertEqual(topology.socket_id(t, 7), 0)
+        self.assertEqual(topology.cpu_pools(t), [[0, 1, 2, 3, 4, 5, 6, 7]])
+
     def test_cpu_pools_include_both_threads_of_every_free_core(self):
         pools = topology.cpu_pools(topo(LAB_RESERVED_CPUS="0,8"))
         self.assertEqual(pools[0], [1, 2, 3, 9, 10, 11])
@@ -84,12 +91,17 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(topology.full_pcpus_only(cfg))
 
     def test_bad_values_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "exactly 2 sockets"):
+        with self.assertRaisesRegex(ValueError, "1 or 2 sockets"):
             topo(LAB_SOCKET_COUNT="4")
         with self.assertRaisesRegex(ValueError, "LAB_THREADS_PER_CORE must be >= 1"):
             topo(LAB_THREADS_PER_CORE="0")
         with self.assertRaisesRegex(ValueError, "alternating or contiguous"):
             topo(LAB_CPU_NUMBERING="round-robin")
+
+    def test_single_socket_is_accepted(self):
+        t = topo(LAB_SOCKET_COUNT="1", LAB_CORES_PER_SOCKET="8", LAB_SOCKET0_PARITY="even")
+        self.assertEqual(t.sockets, 1)
+        self.assertEqual([topology.socket_id(t, cpu) for cpu in range(8)], [0, 0, 0, 0, 0, 0, 0, 0])
 
     def test_no_smt_is_identical_to_the_pre_smt_planner(self):
         # Regression guard for the refactor: with one thread per core the model

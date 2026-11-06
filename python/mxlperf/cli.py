@@ -88,7 +88,10 @@ def wait_for_pcm_cross_numa(
     maximum_sample_age: float = 30,
     timeout: int = 120,
     query_fn=prom_query,
+    socket_count: int | None = None,
 ) -> None:
+    if socket_count is not None and socket_count <= 1:
+        return
     if not pcm_selector:
         raise RuntimeError("pinned measurement requires pcm-sensor-server on target worker")
     probes = {
@@ -578,7 +581,9 @@ def cmd_run(args) -> int:
             rdt_capabilities(cfg)
         if cfg.get("PLACEMENT") == "exclusive":
             print("validating PCM UPI telemetry before pinned admission", file=sys.stderr)
-            wait_for_pcm_cross_numa(cfg["LAB_PROM_URL"], pcm_selector)
+            wait_for_pcm_cross_numa(
+                cfg["LAB_PROM_URL"], pcm_selector, socket_count=int(cfg.get("LAB_SOCKET_COUNT", "1"))
+            )
         if is_host_noise(cfg):
             print("starting host-wide noisy neighbor on both socket CPU pools", file=sys.stderr)
             start_host_noise(cfg)
@@ -632,7 +637,9 @@ def cmd_run(args) -> int:
             wait_for_noisy_neighbor(namespace, cfg)
         if cfg.get("PLACEMENT") == "exclusive":
             print("revalidating PCM UPI telemetry after pinned admission", file=sys.stderr)
-            wait_for_pcm_cross_numa(cfg["LAB_PROM_URL"], pcm_selector)
+            wait_for_pcm_cross_numa(
+                cfg["LAB_PROM_URL"], pcm_selector, socket_count=int(cfg.get("LAB_SOCKET_COUNT", "1"))
+            )
         warmup = duration(args.warmup or f"{cfg['LAB_WARMUP']}s")
         measure = duration(args.measure or f"{cfg['LAB_DURATION']}s")
         if is_rdt_enabled(cfg):
@@ -734,7 +741,8 @@ def add_scenario_flags(parser) -> None:
     parser.add_argument(
         "--noisy-neighbor", metavar="PROFILE", default="",
         help="run alongside noisy-neighbors/PROFILE.env: host-a (host scope, steals CPU too) "
-             "or pod-a / pod-b / pod-c (Guaranteed Pods, one per socket)",
+             "or pod-a / pod-b / pod-c (Guaranteed Pods, one per socket; use pod-a-1s / pod-b-1s / "
+             "pod-c-1s, a single Pod, on a one-socket worker)",
     )
 
 

@@ -78,6 +78,29 @@ scripts/run.sh pinned --streams 4 --noisy-neighbor host-a --rdt-control mba-20 \
 
 For the Pod profiles, use the campaign stream counts.
 
+### Single-socket workers
+
+A one-socket worker has no second socket for the second Pod, so the two-Pod
+profiles can never reach `split` and abort with `socket split required`. Use the
+single-Pod variants instead:
+
+| Profile | Shape | Same pressure as |
+|---|---|---|
+| [`pod-a-1s`](../noisy-neighbors/pod-a-1s.env) | 1 Guaranteed Pod, 5 exclusive cores | one of the two `pod-a` Pods |
+| [`pod-b-1s`](../noisy-neighbors/pod-b-1s.env) | 1 Guaranteed Pod, 12 exclusive cores | one of the two `pod-b` Pods |
+| [`pod-c-1s`](../noisy-neighbors/pod-c-1s.env) | 1 Guaranteed Pod, 24 exclusive cores | one of the two `pod-c` Pods |
+
+```bash
+scripts/run.sh pinned --streams 2 --noisy-neighbor pod-a-1s --rdt-monitor --warmup 1m --measure 2m
+```
+
+The neighbor asks for whole cores, so with SMT on it costs twice that many CPUs
+(`pod-c-1s` is 48 CPUs). The planner counts only the video workload, so check the
+neighbor fits next to it: a neighbor that does not fit stays `Pending` and the
+run waits for it. `host-a` already works on one socket and runs a single STREAM
+group there. Rows from a one-socket worker measure contention on one socket and are
+not comparable with the two-socket reference rows.
+
 ### One neighbor per worker instead
 
 Everything above keeps both neighbors on the worker under measurement, which is

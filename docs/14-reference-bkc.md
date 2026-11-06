@@ -98,7 +98,7 @@ Topology Manager, not manual `taskset` CPU ownership.
 
 | Component | Version |
 |---|---|
-| FFmpeg + MXL image | built from `cbcrc/guidance-for-building-ffmpeg-with-mxl` @ `9b5098a`, tagged `localhost/mxl-ffmpeg-full:v1` |
+| FFmpeg + MXL image | built from `cbcrc/guidance-for-building-ffmpeg-with-mxl` @ `88aa58bbcbc51cdfea636d83c30f95ca80151ea6`, tagged `localhost/mxl-ffmpeg-full:v1` |
 | Intel PCM | `intel/pcm` @ `2026-07-08-public`, `pcm-sensor-server` on host port 9738 |
 | PerfSpect | 3.17.0_2026-04-20_956744c9 |
 | nerdctl | 2.3.2 |
@@ -162,8 +162,9 @@ RDT QoS validation — the policy that restored ≥ 59.5 FPS for each neighbor:
   only if `LAB_THREADS_PER_CORE` matches the hardware and `LAB_RESERVED_CPUS`
   covers whole cores. A mismatch either fails admission or hands out half the cores
   the scenario claims. Every run records this in `host.json`.
-* **Socket count.** The CPU-pool planner requires exactly two sockets and stops
-  with an error otherwise. One-socket and four-socket machines need the planner
-  in [python/mxlperf/render.py](../python/mxlperf/render.py) extended first.
+* **Socket count.** The CPU-pool planner supports 1- and 2-socket machines. A
+  single-socket system is treated as one NUMA pool with all logical CPUs on
+  socket 0; the dual-socket parity logic remains active for the reference 2-socket
+  platform and for any 2-socket worker using alternating CPU IDs.
 * **Intel RDT support.** Without `cat_l3` and `mba` in the CPU flags, steps 11 and
   12 cannot run at all. Steps 1–10 still work.

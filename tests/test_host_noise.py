@@ -10,7 +10,7 @@ class HostNoiseTests(unittest.TestCase):
 
     def test_host_a_pins_one_group_per_socket(self):
         cfg = load_config("pinned", [
-            "LAB_CORES_PER_SOCKET=64", "LAB_CPU_NUMBERING=alternating",
+            "LAB_SOCKET_COUNT=2", "LAB_CORES_PER_SOCKET=64", "LAB_CPU_NUMBERING=alternating",
             "LAB_RESERVED_CPUS=0-3",
         ], "host-a")
         cfg["NODE"] = cfg["LAB_DEFAULT_NODE"]
@@ -36,16 +36,36 @@ class HostNoiseTests(unittest.TestCase):
         self.assertTrue(all(cpu % 2 == 1 for cpu in plan["commands"][1]["cpus"]))
 
     def test_host_a_uses_socket_local_contiguous_cpu_pools(self):
-        cfg = load_config("pinned", [], "host-a")
+        cfg = load_config("pinned", [
+            "LAB_SOCKET_COUNT=2",
+            "LAB_CORES_PER_SOCKET=32",
+            "LAB_CPU_NUMBERING=contiguous",
+            "LAB_RESERVED_CPUS=0-1,30-31",
+        ], "host-a")
         plan = host_noise_plan(cfg)
-        self.assertEqual(plan["commands"][0]["cpus"], list(range(2, 32)))
-        self.assertEqual(plan["commands"][1]["cpus"], list(range(32, 60)) + [62, 63])
+        self.assertEqual(plan["commands"][0]["cpus"], list(range(2, 30)))
+        self.assertEqual(plan["commands"][1]["cpus"], list(range(32, 64)))
         self.assertEqual(plan["commands"][0]["argv"][:5], [
-            "taskset", "-c", "2-31", "numactl", "--membind=0",
+            "taskset", "-c", "2-29", "numactl", "--membind=0",
         ])
         self.assertEqual(plan["commands"][1]["argv"][:5], [
-            "taskset", "-c", "32-59,62-63", "numactl", "--membind=1",
+            "taskset", "-c", "32-63", "numactl", "--membind=1",
         ])
+
+    def test_host_noise_supports_single_socket_workers(self):
+        cfg = load_config("pinned", [
+            "LAB_SOCKET_COUNT=1",
+            "LAB_CORES_PER_SOCKET=8",
+            "LAB_THREADS_PER_CORE=1",
+            "LAB_RESERVED_CPUS=0",
+            "NOISY_NEIGHBOR_HOST_WORKERS_PER_SOCKET=1",
+        ], "host-a")
+        cfg["NODE"] = cfg["LAB_DEFAULT_NODE"]
+        plan = host_noise_plan(cfg)
+        self.assertEqual(plan["total_workers"], 1)
+        self.assertEqual(len(plan["commands"]), 1)
+        self.assertEqual(plan["commands"][0]["numa_node"], 0)
+        self.assertEqual(plan["commands"][0]["cpus"], [1, 2, 3, 4, 5, 6, 7])
 
     def test_host_noise_rejects_unsafe_extra_arguments(self):
         cfg = load_config("baseline", [], "host-a")
@@ -61,7 +81,7 @@ class HostNoiseTests(unittest.TestCase):
 
     def test_host_noise_rejects_workers_above_socket_pool(self):
         cfg = load_config("baseline", [
-            "LAB_CORES_PER_SOCKET=64", "LAB_CPU_NUMBERING=alternating",
+            "LAB_SOCKET_COUNT=2", "LAB_CORES_PER_SOCKET=64", "LAB_CPU_NUMBERING=alternating",
             "LAB_RESERVED_CPUS=0-3",
         ], "host-a")
         cfg["NOISY_NEIGHBOR_HOST_WORKERS_PER_SOCKET"] = "63"

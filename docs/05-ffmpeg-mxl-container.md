@@ -45,7 +45,7 @@ requires both the MP4/MOV demuxer and MXL muxer.
 | Setting | Value | Note |
 |---|---|---|
 | `CBC_REPO` | `https://github.com/cbcrc/guidance-for-building-ffmpeg-with-mxl.git` | CBC's build guidance for FFmpeg with MXL |
-| `CBC_REF` | `9b5098a` | Pinned. Bump deliberately — a different FFmpeg or MXL revision changes encoder cost and therefore every density number. |
+| `CBC_REF` | `88aa58bbcbc51cdfea636d83c30f95ca80151ea6` | Pinned. Prefer a commit SHA or a current branch name that is known to exist; do not rely on mutable branch names such as `dmf-mxl/master`, which can be renamed upstream and break the build. |
 | `LAB_IMAGE` | `localhost/mxl-ffmpeg-full:v1` | from `config/lab.env` |
 | `LAB_IMAGE_PULL_POLICY` | `Never` | a run can never silently pick up a different build from a registry |
 | containerd namespace | `k8s.io` | anything else is invisible to the kubelet |
@@ -123,7 +123,7 @@ ffmpeg -stream_loop -1 -re -i /media/$INPUT_FILE -c:v v210 \
 **Encoder** — waits for the flow file to appear, then encodes it live:
 
 ```
-ffmpeg -f mxl -grain_index_init 1 -on_too_late 0 -i /dev/shm/mxl/$VIDEO_ID.mxl-flow \
+ffmpeg -f mxl -mxl_read_index_init 1 -on_too_late 0 -i /dev/shm/mxl/$VIDEO_ID.mxl-flow \
        -threads 15 -vf format=yuv420p -c:v libx264 -preset medium -tune zerolatency \
        -bf 0 -rc-lookahead 0 -g 30 -sc_threshold 0 \
        -x264-params sliced-threads=0:slices=2:threads=15 \

@@ -149,7 +149,7 @@ spec:
         - /opt/bin/ffmpeg
         - -f
         - mxl
-        - -grain_index_init
+        - -mxl_read_index_init
         - "1"
         - -on_too_late
         - "0"

@@ -35,14 +35,20 @@ helm upgrade --install "$RELEASE" prometheus-community/kube-prometheus-stack \
 kubectl -n monitoring rollout status "daemonset/$RELEASE-prometheus-node-exporter" --timeout=5m
 
 echo "== 2/3 host PCM scrape targets =="
+# One-socket CPUs have no UPI links, so only DRAM counters can be required there.
+if (( ${LAB_SOCKET_COUNT:-1} > 1 )); then
+  pcm_marker='Incoming_Data_Traffic_On_Link_'; pcm_what='UPI'
+else
+  pcm_marker='DRAM_Reads'; pcm_what='DRAM'
+fi
 IFS=, read -r -a workers <<<"$LAB_WORKERS"
 for node in "${workers[@]}"; do
   node_ip="$(kubectl get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')"
   [[ -n "$node_ip" ]] || { echo "FATAL: no InternalIP for node $node" >&2; exit 1; }
   if ! curl -fsS --max-time 5 \
       "http://$node_ip:9738/metrics" 2>/dev/null |
-      grep -F 'Incoming_Data_Traffic_On_Link_' >/dev/null; then
-    echo "FATAL: $node ($node_ip:9738) is not serving UPI counters." >&2
+      grep -F "$pcm_marker" >/dev/null; then
+    echo "FATAL: $node ($node_ip:9738) is not serving $pcm_what counters." >&2
     echo "Run scripts/bootstrap-worker.sh $node, then re-run this script." >&2
     exit 1
   fi

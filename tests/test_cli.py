@@ -28,6 +28,17 @@ class CliTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires pcm-sensor-server"):
             wait_for_pcm_cross_numa("http://prometheus", "")
 
+    def test_pinned_pcm_preflight_skips_single_socket_hosts(self):
+        self.assertIsNone(
+            wait_for_pcm_cross_numa(
+                "http://prometheus",
+                'job="pcm-sensor-server"',
+                socket_count=1,
+                timeout=0,
+                query_fn=lambda _url, _query: [],
+            )
+        )
+
     def test_pinned_pcm_preflight_reports_empty_query(self):
         with self.assertRaisesRegex(RuntimeError, "UPI: query returned no series"):
             wait_for_pcm_cross_numa(

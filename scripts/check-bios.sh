@@ -79,7 +79,10 @@ if [[ "$nodes" == "$sockets" ]]; then ok "Sub-NUMA Clustering disabled" "$nodes 
 else bad "NUMA node count" "$nodes nodes for $sockets sockets" "Memory Settings -> Sub-NUMA Cluster = Disabled"; fi
 
 # 3. NUMA must be enabled at all (interleaved memory would hide all locality).
-if [[ "$nodes" -ge 2 ]]; then ok "NUMA enabled" "$nodes nodes"
+#    A single-socket machine legitimately has one node and nothing to interleave
+#    across; check 2 already rejects Sub-NUMA Clustering there.
+if [[ "$sockets" -lt 2 ]]; then ok "NUMA" "single socket, $nodes node (nothing to interleave)"
+elif [[ "$nodes" -ge 2 ]]; then ok "NUMA enabled" "$nodes nodes"
 else bad "NUMA" "only $nodes node" "Memory Settings -> Node Interleaving = Disabled"; fi
 
 # 4. Turbo must be ON: the encoder is latency-sensitive and relies on turbo

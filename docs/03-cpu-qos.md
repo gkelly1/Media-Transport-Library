@@ -119,7 +119,7 @@ This is only required for benchmarking purposes only
 LAB_CONTROLLER=control-plane
 LAB_WORKERS=worker-1            # comma-separated if you have several
 LAB_DEFAULT_NODE=worker-1       # the worker runs get measured on
-LAB_SOCKET_COUNT=2         # sockets on the worker (2 is required, see below)
+LAB_SOCKET_COUNT=1         # 1 or 2 sockets on the worker; single-socket is supported
 LAB_CORES_PER_SOCKET=64    # physical cores per socket
 LAB_SOCKET0_PARITY=even    # see "CPU numbering" below
 LAB_RESERVED_CPUS=0-3      # kept away from the workload
@@ -136,24 +136,31 @@ Hyper-Threading or Sub-NUMA Clustering is still on — go back to
 [01-bios-bkc.md](01-bios-bkc.md).
 
 **CPU numbering.** Check how your BIOS enumerates CPUs, because the CPU-pool
-planner depends on it:
+planner depends on it. The key detail is to look at `CORE`, `SOCKET`, and `NODE`
+so you can tell which logical threads belong to the same physical core and which
+NUMA domain they sit in:
 
 ```bash
-ssh <user>@<worker> "lscpu -p=CPU,NODE | grep -v '^#' | head -4"
+ssh <user>@<worker> "lscpu -p=CPU,CORE,SOCKET,NODE | grep -v '^#' | head -8"
 ```
 
-The expected output is CPU 0 and 2 on NUMA node 0, CPU 1 and 3 on node 1: the
-IDs alternate between sockets, so socket 0 owns the even IDs and
-`LAB_SOCKET0_PARITY=even` is correct. If the alternation runs the other way
-(CPU 0 on node 1), set `LAB_SOCKET0_PARITY=odd`.
+The expected output is a set of CPU IDs that share the same `CORE` value on a
+single physical core, while the `NODE` and `SOCKET` columns show the memory
+locality and package they belong to. For example, CPUs `0` and `1` sharing the
+same `CORE=0` means they are the two threads of one physical core; CPUs with the
+same `SOCKET` and `NODE` values are in the same package and NUMA domain.
+
+If the IDs alternate between sockets — for example, even IDs on socket 0 and odd
+IDs on socket 1 — then socket 0 owns the even IDs and `LAB_SOCKET0_PARITY=even`
+is correct. If the alternation runs the other way (CPU 0 on socket 1), set
+`LAB_SOCKET0_PARITY=odd`.
 
 If instead the IDs come in contiguous blocks — the whole first half on node 0 —
-the planner does not model your machine: it assumes alternating IDs and
-2 sockets, and it will place `numa-pool` sessions on the wrong socket *silently*,
-because the `taskset` call itself still succeeds. Confirm the layout with
-`numactl --hardware`, and treat the `numa-pool` scenario as unsupported until
-`cpu_pools()` in [python/mxlperf/render.py](../python/mxlperf/render.py) is
-extended. `baseline` and `pinned` do not depend on the parity model.
+set `LAB_CPU_NUMBERING=contiguous`. The planner supports both `alternating` and
+`contiguous` numbering for 1- and 2-socket systems. On a single-socket machine,
+all CPUs are treated as socket 0 regardless of the numbering mode, so the
+`numa-pool` and pinned scenarios still follow the same topology rules without
+requiring a second NUMA node.
 
 **Reserved CPUs.** `LAB_RESERVED_CPUS` is the set kept for the kubelet,
 containerd, the metrics exporters and the RDT helper. Reserve at least two CPUs

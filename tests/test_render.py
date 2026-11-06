@@ -46,6 +46,34 @@ class NoisyNeighborTests(unittest.TestCase):
                     container["resources"]["limits"]["memory"],
                 )
 
+    def test_single_socket_profiles_run_one_pod_with_the_same_per_pod_pressure(self):
+        # Each -1s profile is its two-socket sibling with the second Pod removed:
+        # the per-socket pressure is identical, so results stay comparable.
+        single_socket = [
+            "LAB_SOCKET_COUNT=1", "LAB_CORES_PER_SOCKET=36", "LAB_THREADS_PER_CORE=2",
+            "LAB_CPU_NUMBERING=contiguous", "LAB_RESERVED_CPUS=0-1,36-37",
+        ]
+        for profile in ("pod-a", "pod-b", "pod-c"):
+            with self.subTest(profile=profile):
+                two_socket = load_config("pinned", [], profile)
+                one_socket = load_config("pinned", single_socket, f"{profile}-1s")
+                for key in (
+                    "NOISY_NEIGHBOR_ARGS", "NOISY_NEIGHBOR_CPU_REQUEST", "NOISY_NEIGHBOR_MEMORY_REQUEST",
+                    "NOISY_NEIGHBOR_MEMORY_LIMIT", "NOISY_NEIGHBOR_GUARANTEED",
+                ):
+                    self.assertEqual(one_socket[key], two_socket[key], key)
+                self.assertEqual(one_socket["NOISY_NEIGHBOR_POD_COUNT"], "1")
+                # A split can never happen with one Pod, so nothing may demand it.
+                self.assertNotEqual(one_socket.get("NOISY_NEIGHBOR_REQUIRE_SOCKET_SPLIT"), "1")
+                one_socket["NODE"] = one_socket["LAB_DEFAULT_NODE"]
+                pods = noisy_neighbor_pods(one_socket)
+                self.assertEqual([pod["metadata"]["name"] for pod in pods], ["mxl-noisy-neighbor"])
+                resources = pods[0]["spec"]["containers"][0]["resources"]
+                # Guaranteed, in whole cores: 5/12/24 cores cost twice that many CPUs with SMT on.
+                cpus = str(int(two_socket["NOISY_NEIGHBOR_CPU_REQUEST"]) * 2)
+                self.assertEqual(resources["requests"]["cpu"], cpus)
+                self.assertEqual(resources["limits"]["cpu"], cpus)
+
     def test_pod_placement_follows_the_spread_switch(self):
         cfg = load_config("pinned", [], "pod-a")
         cfg["NODE"] = cfg["LAB_DEFAULT_NODE"]
@@ -130,6 +158,19 @@ class PlacementTests(unittest.TestCase):
         pools = cpu_pools(cfg)
         self.assertEqual(pools[0], list(range(2, 32)))
         self.assertEqual(pools[1], list(range(32, 60)) + [62, 63])
+
+    def test_single_socket_numa_pool_does_not_index_past_the_pool(self):
+        cfg = load_config("numa-pool", [
+            "STREAMS=4",
+            "LAB_SOCKET_COUNT=1",
+            "LAB_CORES_PER_SOCKET=32",
+            "LAB_THREADS_PER_CORE=2",
+            "LAB_CPU_NUMBERING=contiguous",
+            "LAB_RESERVED_CPUS=0-1,32-33",
+        ])
+        plan = plan_cpu_sets(cfg)
+        self.assertEqual([row["socket"] for row in plan], [0, 0, 0, 0])
+        self.assertEqual(len(plan[0]["encoder"]), len(cpu_pools(cfg)[0]))
 
     def test_pinned_delegates_cpu_ids_to_the_kubelet(self):
         cfg = load_config("pinned", [

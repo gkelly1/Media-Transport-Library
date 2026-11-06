@@ -98,7 +98,7 @@ open results/summary.html               # 3 rows: baseline, numa-pool, pinned
 config/lab.env          every tunable, commented; the one file to edit
 config/nodes.env        SSH inventory: host addresses and login (fill in first)
 scenarios/              the three benchmark cases: baseline, numa-pool, pinned
-noisy-neighbors/        the four co-tenant profiles: host-a, pod-a, pod-b, pod-c
+noisy-neighbors/        co-tenant profiles: host-a, pod-a, pod-b, pod-c (plus pod-a-1s, pod-b-1s, pod-c-1s for one socket)
 campaigns/              ready-made run lists (density, RDT sweeps)
 scripts/                one script per step of the guide, all idempotent
 python/mxlperf/         the runner: plan → deploy → collect → report → summarize

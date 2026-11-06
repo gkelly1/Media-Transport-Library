@@ -140,20 +140,15 @@ tail -n 80 {shlex.quote(LOG_FILE)} 2>/dev/null || true
 def start_host_noise(cfg: dict[str, str]) -> dict[str, Any]:
     plan = host_noise_plan(cfg)
     command_strings = [shlex.join(item["argv"]) for item in plan["commands"]]
+    pid_lines = "\n".join(
+        f"sh -c {shlex.quote(command)} & pids+=(\"$!\")" for command in command_strings
+    )
     supervisor = f"""
-p0=''; p1=''
-cleanup() {{
-  trap - TERM INT EXIT
-  [ -z "$p0" ] || kill "$p0" 2>/dev/null || true
-  [ -z "$p1" ] || kill "$p1" 2>/dev/null || true
-  [ -z "$p0" ] || wait "$p0" 2>/dev/null || true
-  [ -z "$p1" ] || wait "$p1" 2>/dev/null || true
-}}
-trap 'cleanup; exit 0' TERM INT
-trap cleanup EXIT
-{command_strings[0]} & p0=$!
-{command_strings[1]} & p1=$!
-while kill -0 "$p0" 2>/dev/null && kill -0 "$p1" 2>/dev/null; do sleep 1; done
+pids=()
+{pid_lines}
+for pid in "${{pids[@]}}"; do
+  while kill -0 "$pid" 2>/dev/null; do sleep 1; done
+done
 exit 1
 """.strip()
     launch = f"nohup setsid sh -c {shlex.quote(supervisor)} >{shlex.quote(LOG_FILE)} 2>&1 </dev/null & pid=$!; echo \"$pid\" >{shlex.quote(PID_FILE)}"
@@ -179,13 +174,14 @@ printf '%s\n' "$pid"
     while time.monotonic() < deadline:
         try:
             snapshot = host_noise_snapshot(cfg)
-            if snapshot["stress_process_count"] >= 2:
+            if snapshot["stress_process_count"] >= len(plan["commands"]):
                 return snapshot
         except (OSError, RuntimeError) as error:
             last_error = error
         time.sleep(0.5)
     stop_host_noise(cfg)
-    raise RuntimeError(f"host noisy-neighbor failed to start both socket workers: {last_error or 'processes missing'}")
+    expected = len(plan["commands"])
+    raise RuntimeError(f"host noisy-neighbor failed to start {expected} worker process(es): {last_error or 'processes missing'}")
 
 
 def stop_host_noise(cfg: dict[str, str]) -> str:

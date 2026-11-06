@@ -141,7 +141,7 @@ def test_combined_profile_sets_both_schemata_resources() -> None:
 
 
 def test_rdt_disabled_by_default() -> None:
-    cfg = load_config("baseline", [])
+    cfg = load_config("baseline", ["RDT_MONITOR=0", "RDT_CONTROL_PROFILE=none"])
     assert not is_rdt_enabled(cfg)
     validate_rdt_config(cfg)
 

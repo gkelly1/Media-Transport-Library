@@ -23,8 +23,14 @@ def plan_cpu_sets(cfg: dict[str, str]) -> list[dict[str, Any]]:
         return [{"session": i, "socket": "scheduler", "decoder": [], "encoder": []} for i in range(1, streams + 1)]
     pools = cpu_pools(cfg)
     if mode == "numa-pool":
+        pool_count = len(pools)
         return [
-            {"session": i, "socket": (i - 1) % 2, "decoder": pools[(i - 1) % 2], "encoder": pools[(i - 1) % 2]}
+            {
+                "session": i,
+                "socket": (i - 1) % pool_count,
+                "decoder": pools[(i - 1) % pool_count],
+                "encoder": pools[(i - 1) % pool_count],
+            }
             for i in range(1, streams + 1)
         ]
     if mode != "exclusive":
@@ -313,7 +319,7 @@ def pod_spec(cfg: dict[str, str], placement: dict[str, Any], role: str) -> dict[
             f'for attempt in $(seq 1 120); do [[ -e "$MXL_DOMAIN/$VIDEO_ID.mxl-flow" ]] && break; sleep 1; done; '
             f'[[ -e "$MXL_DOMAIN/$VIDEO_ID.mxl-flow" ]] || {{ echo "MXL flow did not appear" >&2; exit 1; }}; '
             f'exec {affinity}$FFMPEG -hide_banner -loglevel info {filter_args}-f mxl '
-            f'-grain_index_init 1 -on_too_late 0 -i "$MXL_DOMAIN/$VIDEO_ID.mxl-flow" {thread_args}'
+            f'-mxl_read_index_init 1 -on_too_late 0 -i "$MXL_DOMAIN/$VIDEO_ID.mxl-flow" {thread_args}'
             f'-vf format=yuv420p -c:v libx264 -preset "$PRESET" -tune zerolatency '
             f'-bf 0 -rc-lookahead 0 -g 30 -sc_threshold 0 {x264}'
             f'-maxrate "$BITRATE" -bufsize 1M -progress /run/mxl/progress -f null -'

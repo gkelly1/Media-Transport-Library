@@ -42,8 +42,8 @@ class Topology:
 
 def from_config(cfg: dict[str, str]) -> Topology:
     sockets = int(cfg["LAB_SOCKET_COUNT"])
-    if sockets != 2:
-        raise ValueError("current parity planner requires exactly 2 sockets")
+    if sockets < 1 or sockets > 2:
+        raise ValueError("current planner supports 1 or 2 sockets")
     threads = int(cfg.get("LAB_THREADS_PER_CORE", "1"))
     if threads < 1:
         raise ValueError("LAB_THREADS_PER_CORE must be >= 1")
@@ -76,6 +76,8 @@ def siblings(topology: Topology, cpu: int) -> list[int]:
 
 
 def socket_id(topology: Topology, cpu: int) -> int:
+    if topology.sockets == 1:
+        return 0
     core = core_id(topology, cpu)
     if topology.numbering == "contiguous":
         return core // topology.cores_per_socket

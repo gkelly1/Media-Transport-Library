@@ -96,6 +96,8 @@ for node in "${workers[@]}"; do
     cores_per_socket=\$(lscpu | awk -F: '/^Core\\(s\\) per socket/{gsub(/ /,\"\",\$2); print \$2}')
     if [ \"\$threads_per_core\" = '${LAB_THREADS_PER_CORE:-1}' ]; then t OK \"topology has \$threads_per_core threads/core\"; else t MISS \"topology has \$threads_per_core threads/core but LAB_THREADS_PER_CORE=${LAB_THREADS_PER_CORE:-1}; every Guaranteed CPU request is sized from it\"; fi
     if [ \"\$cores_per_socket\" = '$LAB_CORES_PER_SOCKET' ]; then t OK \"topology has \$cores_per_socket cores/socket\"; else t MISS \"topology has \$cores_per_socket cores/socket but LAB_CORES_PER_SOCKET=$LAB_CORES_PER_SOCKET\"; fi
+    sockets=\$(lscpu | awk -F: '/^Socket\\(s\\)/{gsub(/ /,\"\",\$2); print \$2}')
+    if [ \"\$sockets\" = '${LAB_SOCKET_COUNT:-1}' ]; then t OK \"topology has \$sockets socket(s)\"; else t MISS \"topology has \$sockets socket(s) but LAB_SOCKET_COUNT=${LAB_SOCKET_COUNT:-1}; the planner would place cpusets on sockets that do not exist\"; fi
     grep -q 'cpuManagerPolicy: static' /var/lib/kubelet/config.yaml 2>/dev/null && t OK 'kubelet static CPU Manager' || t WARN 'cannot confirm static CPU Manager - run scripts/configure-cpu-qos.sh (pinned scenario needs it)'
     # Power: the governor is a MISS because a ramping governor costs whole streams
     # and would be read as a property of the platform. The driver mode and EPB are

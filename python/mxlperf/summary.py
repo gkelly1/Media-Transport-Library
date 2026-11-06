@@ -31,6 +31,18 @@ NOISE_PROFILE_PURPOSES = {
         "Two Guaranteed neighbor Pods, one per socket, 24 exclusive CPUs each, 512 MiB STREAM "
         "working set. Worst realistic co-tenant: saturates LLC and memory controllers together."
     ),
+    "pod-a-1s": (
+        "Single-socket pod-a: one Guaranteed neighbor Pod, 5 exclusive cores, 32 MiB STREAM "
+        "working set. Same per-socket pressure as pod-a on a worker with only one socket."
+    ),
+    "pod-b-1s": (
+        "Single-socket pod-b: one Guaranteed neighbor Pod, 12 exclusive cores, 196 MiB STREAM "
+        "working set. Same per-socket pressure as pod-b on a worker with only one socket."
+    ),
+    "pod-c-1s": (
+        "Single-socket pod-c: one Guaranteed neighbor Pod, 24 exclusive cores, 512 MiB STREAM "
+        "working set. Same per-socket pressure as pod-c on a worker with only one socket."
+    ),
 }
 
 
